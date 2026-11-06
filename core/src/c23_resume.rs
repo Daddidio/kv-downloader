@@ -279,6 +279,32 @@ impl ResumeStore {
 
         Ok(None)
     }
+    /// Select a fresh download or resume a matching unfinished job.
+    /// Returns the job and the tracks that actually need downloading.
+    pub fn plan_download(
+        &self,
+        request: ResumeJob,
+        resume: bool,
+    ) -> Result<(ResumeJob, Vec<String>)> {
+        if resume {
+            let saved = self.find_unfinished_match(&request)?
+                .ok_or_else(|| anyhow!(
+                    "No matching unfinished download to resume"
+                ))?;
+
+            let pending = saved.pending_tracks()?;
+
+            ensure!(
+                !pending.is_empty(),
+                "No missing tracks to resume"
+            );
+
+            Ok((saved, pending))
+        } else {
+            let selected = request.selected_tracks.clone();
+            Ok((request, selected))
+        }
+    }
     pub fn upsert(&mut self, job: ResumeJob) {
         if let Some(existing) = self.jobs.iter_mut()
             .find(|saved| saved.same_request(&job))
@@ -764,6 +790,92 @@ mod c23_resume_lookup_tests {
         store.upsert(job.clone());
 
         assert!(store.find_unfinished_match(&job)?.is_none());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+}
+
+
+#[cfg(test)]
+mod c23_resume_plan_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn fresh_and_resume_choose_correct_tracks() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+
+        let root = std::env::temp_dir().join(format!(
+            "c23-plan-{}-{unique}",
+            std::process::id()
+        ));
+
+        fs::create_dir_all(&root)?;
+
+        let bass = root.join("Bass.mp3");
+        fs::write(&bass, b"original bass audio")?;
+
+        let request = ResumeJob::new(
+            "https://example.com/song",
+            &root,
+            false,
+            0,
+            vec!["Bass".into(), "Drums".into()],
+        )?;
+
+        let mut saved = request.clone();
+        saved.record_completed("Bass", &bass)?;
+
+        let mut store = ResumeStore::default();
+        store.upsert(saved);
+
+        // Fresh download must request both tracks.
+        let (fresh, all_tracks) =
+            store.plan_download(request.clone(), false)?;
+
+        assert_eq!(all_tracks, vec!["Bass", "Drums"]);
+        assert!(fresh.completed.is_empty());
+
+        // Resume must request only missing tracks.
+        let (resumed, missing) =
+            store.plan_download(request.clone(), true)?;
+
+        assert_eq!(missing, vec!["Drums"]);
+        assert_eq!(resumed.completed.len(), 1);
+
+        // A changed file must be downloaded again.
+        fs::write(&bass, b"modified bass audio")?;
+
+        let (_, missing) =
+            store.plan_download(request.clone(), true)?;
+
+        assert_eq!(missing, vec!["Bass", "Drums"]);
+
+        // A different key must not resume this job.
+        let different_key = ResumeJob::new(
+            "https://example.com/song",
+            &root,
+            false,
+            -1,
+            vec!["Bass".into(), "Drums".into()],
+        )?;
+
+        assert!(store.plan_download(different_key, true).is_err());
+
+        // Resuming a nonexistent job must not silently
+        // start a completely new download.
+        let another_song = ResumeJob::new(
+            "https://example.com/another-song",
+            &root,
+            false,
+            0,
+            vec!["Bass".into()],
+        )?;
+
+        assert!(store.plan_download(another_song, true).is_err());
 
         fs::remove_dir_all(root)?;
         Ok(())
