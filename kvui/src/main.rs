@@ -1729,6 +1729,132 @@ fn c23_resume_is_available(
     Ok(store.find_unfinished_match(&request)?.is_some())
 }
 
+/// Find unfinished HTTP jobs for this song without requiring the user to
+/// remember the previously selected stems or key. Never guess a destination.
+fn c23_restorable_jobs(
+    song: &Song,
+    available_tracks: &[Track],
+    download_root: &Path,
+    store: &kv_core::c23_resume::ResumeStore,
+) -> Result<Vec<kv_core::c23_resume::ResumeJob>> {
+    let mut matches = Vec::new();
+    for saved in &store.jobs {
+        if saved.song_url != song.url
+            || !(-4..=4).contains(&saved.transpose)
+            || saved.selected_tracks.is_empty()
+            || saved.selected_tracks.iter().any(|selected| {
+                !available_tracks.iter().any(|track| track.name.eq_ignore_ascii_case(selected))
+            })
+        {
+            continue;
+        }
+
+        // Verify the currently selected root and song's safe keyed destination.
+        let expected = match kvui_select_keyed_song_destination(
+            download_root,
+            &song.artist,
+            &song.title,
+            &song.url,
+            saved.transpose,
+        ) {
+            Ok(destination) => destination,
+            Err(err) => {
+                tracing::warn!("Saved resume destination cannot be checked: {err}");
+                continue;
+            }
+        };
+        if saved.destination != expected {
+            continue;
+        }
+
+        // An already-completed job is not an unfinished download.
+        if !saved.pending_tracks()?.is_empty() {
+            matches.push(saved.clone());
+        }
+    }
+    Ok(matches)
+}
+
+/// Offer to restore settings; never automatically begin downloading.
+fn c23_offer_saved_selection(app: &mut App, song: &Song) {
+    use kv_core::c23_resume::ResumeStore;
+
+    let matches = (|| -> Result<_> {
+        let store = ResumeStore::load(&ResumeStore::default_path()?)?;
+        c23_restorable_jobs(song, &app.tracks, &app.download_dir, &store)
+    })();
+
+    match matches {
+        Ok(mut jobs) if jobs.len() == 1 => {
+            let job = jobs.pop().unwrap();
+            match job.pending_tracks() {
+                Ok(pending) => {
+                    app.confirm = Some(ConfirmState {
+                        message: vec![
+                            format!("Unfinished download: {} stems, {} remaining.", job.selected_tracks.len(), pending.len()),
+                            format!("Restore selected stems, key {:+}, intro click {}?", job.transpose, if job.count_in { "On" } else { "Off" }),
+                            "Restoring settings will not start a download.".to_string(),
+                        ],
+                        selected: 1, // No is the safe default.
+                        payload: ConfirmPayload::RestoreSavedSelection { job },
+                    });
+                }
+                Err(err) => app.status = format!("Cannot inspect saved download: {err}"),
+            }
+        }
+        Ok(jobs) if jobs.len() > 1 => {
+            app.status = format!(
+                "{} unfinished versions of this song exist; no selection was changed.",
+                jobs.len()
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!("Could not inspect saved downloads: {err}");
+            app.status = format!("Could not inspect saved downloads: {err}");
+        }
+    }
+}
+
+fn c23_apply_saved_selection(
+    app: &mut App,
+    job: &kv_core::c23_resume::ResumeJob,
+) -> Result<()> {
+    let song = app.current_song.as_ref().ok_or_else(|| anyhow!("No song selected"))?;
+    if song.url != job.song_url {
+        return Err(anyhow!("Saved download belongs to a different song"));
+    }
+    let expected = kvui_select_keyed_song_destination(
+        &app.download_dir, &song.artist, &song.title, &song.url, job.transpose,
+    )?;
+    if expected != job.destination || job.pending_tracks()?.is_empty() {
+        return Err(anyhow!("Saved download is no longer resumable in this destination"));
+    }
+
+    let selected = job.selected_tracks.iter()
+        .map(|name| name.to_lowercase())
+        .collect::<std::collections::HashSet<_>>();
+    if selected.len() != job.selected_tracks.len()
+        || selected.iter().any(|name| {
+            !app.tracks.iter().any(|track| track.name.eq_ignore_ascii_case(name))
+        })
+    {
+        return Err(anyhow!("Saved stems no longer match this song's available tracks"));
+    }
+
+    for track in &mut app.tracks {
+        track.selected = selected.contains(&track.name.to_lowercase());
+    }
+    app.intro_click = job.count_in;
+    app.key_shift = job.transpose;
+    app.use_browser = false; // C23 Resume is HTTP-only.
+    app.status = format!(
+        "Restored {} stems and download settings. Select Download, then Resume.",
+        job.selected_tracks.len()
+    );
+    Ok(())
+}
+
 /// C23: Publish accepted HTTP stems as each download completes.
 /// Preserve completed files even when a later track fails.
 fn run_c23_http_download(
@@ -2421,6 +2547,9 @@ enum ConfirmPayload {
         key_shift: i8,
         resume_available: bool,
     },
+    RestoreSavedSelection {
+        job: kv_core::c23_resume::ResumeJob,
+    },
     ResetSong {
         url: String,
         title: String,
@@ -2680,12 +2809,13 @@ fn update_loading_state(app: &mut App) {
                     if !app.tracks.is_empty() {
                         app.tracks_state.select(Some(0));
                     }
-                    app.current_song = Some(song);
+                    app.current_song = Some(song.clone());
                     app.intro_click = true;
                     app.key_shift = 0;
                     app.base_key = details.base_key;
                     app.detail_focus = DetailFocus::Tracks;
                     app.screen = Screen::SongDetail;
+                    c23_offer_saved_selection(app, &song);
                 }
                 (LoadingKind::Tracks { .. }, LoadingResult::Tracks(Err(err))) => {
                     app.status = format!("Failed to load tracks: {}", err);
@@ -3019,6 +3149,101 @@ mod c23_resume_confirmation_tests {
     }
 }
 
+#[cfg(test)]
+mod c23_saved_selection_restore_tests {
+    use super::*;
+    use kv_core::c23_resume::{ResumeJob, ResumeStore};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn recovery_finds_pending_job_and_applies_only_its_settings() -> Result<()> {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("c23-select-{}-{stamp}", std::process::id()));
+        fs::create_dir(&root)?;
+        let song = Song {
+            title: "Test Song".into(), artist: "Test Artist".into(),
+            url: "https://example.test/song".into(),
+            first_seen: 0, purchase_date: 0,
+        };
+        let destination = kvui_select_keyed_song_destination(
+            &root, &song.artist, &song.title, &song.url, -2,
+        )?;
+        fs::create_dir_all(&destination)?;
+        fs::write(destination.join(KVUI_SONG_SOURCE_FILE), song.url.as_bytes())?;
+        let drum_file = destination.join("Drum Kit.mp3");
+        fs::write(&drum_file, b"verified drums")?;
+        let mut job = ResumeJob::new(
+            &song.url, &destination, false, -2,
+            vec!["Drum Kit".into(), "Bass".into()],
+        )?;
+        job.record_completed("Drum Kit", &drum_file)?;
+
+        let mut store = ResumeStore::default();
+        store.upsert(job.clone());
+        let mut app = App::new(Arc::new(Mutex::new(LogBuffer::new(100))));
+        app.download_dir = root.clone();
+        app.current_song = Some(song.clone());
+        app.tracks = vec![
+            Track { name: "Bass".into(), selected: false },
+            Track { name: "Piano".into(), selected: true },
+            Track { name: "Drum Kit".into(), selected: false },
+        ];
+        app.intro_click = true;
+        app.key_shift = 0;
+        app.use_browser = true;
+
+        let matches = c23_restorable_jobs(&song, &app.tracks, &root, &store)?;
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].pending_tracks()?, vec!["Bass"]);
+        c23_apply_saved_selection(&mut app, &matches[0])?;
+        assert_eq!(app.tracks.iter().map(|t| t.selected).collect::<Vec<_>>(), vec![true, false, true]);
+        assert!(!app.intro_click);
+        assert_eq!(app.key_shift, -2);
+        assert!(!app.use_browser);
+        assert!(app.status.contains("Select Download, then Resume"));
+
+        // Other source URLs and other download roots must never be offered.
+        let mut other_song = song.clone();
+        other_song.url = "https://example.test/other".into();
+        assert!(c23_restorable_jobs(&other_song, &app.tracks, &root, &store)?.is_empty());
+        let other_root = root.join("other-root");
+        fs::create_dir(&other_root)?;
+        assert!(c23_restorable_jobs(&song, &app.tracks, &other_root, &store)?.is_empty());
+
+        // A fully completed job cannot be offered as unfinished.
+        fs::write(destination.join("Bass.mp3"), b"verified bass")?;
+        job.record_completed("Bass", &destination.join("Bass.mp3"))?;
+        store.upsert(job);
+        assert!(c23_restorable_jobs(&song, &app.tracks, &root, &store)?.is_empty());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_unfinished_variants_are_not_implicitly_chosen() -> Result<()> {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("c23-multi-{}-{stamp}", std::process::id()));
+        fs::create_dir(&root)?;
+        let song = Song {
+            title: "Test Song".into(), artist: "Test Artist".into(),
+            url: "https://example.test/song".into(),
+            first_seen: 0, purchase_date: 0,
+        };
+        let tracks = vec![Track { name: "Bass".into(), selected: true }];
+        let mut store = ResumeStore::default();
+        for shift in [0, -2] {
+            let destination = kvui_select_keyed_song_destination(
+                &root, &song.artist, &song.title, &song.url, shift,
+            )?;
+            store.upsert(ResumeJob::new(&song.url, &destination, true, shift, vec!["Bass".into()])?);
+        }
+        assert_eq!(c23_restorable_jobs(&song, &tracks, &root, &store)?.len(), 2);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+}
+
 fn render_confirm_overlay(frame: &mut ratatui::Frame, app: &App) {
     let Some(confirm) = &app.confirm else {
         return;
@@ -3257,6 +3482,15 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
         KeyCode::Enter => {
             let confirm = app.confirm.take().unwrap();
 
+            if let ConfirmPayload::RestoreSavedSelection { job } = &confirm.payload {
+                if confirm.selected == 0 {
+                    if let Err(err) = c23_apply_saved_selection(app, job) {
+                        app.status = format!("Could not restore saved selection: {err}");
+                    }
+                }
+                return Ok(false);
+            }
+
             let resume_available = match &confirm.payload {
                 ConfirmPayload::StartDownload { resume_available, .. } => *resume_available,
                 _ => false,
@@ -3447,6 +3681,7 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                         tracing::info!("Deleted download progress file {}", path);
                         app.status = "All download progress reset".to_string();
                     }
+                    ConfirmPayload::RestoreSavedSelection { .. } => {}
                 }
                 _ => {}
             }
