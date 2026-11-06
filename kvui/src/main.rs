@@ -1648,6 +1648,103 @@ fn prepare_staged_download(
         }
     }
 }
+/// C23: Publish accepted HTTP stems as each download completes.
+/// Preserve completed files even when a later track fails.
+fn run_c23_http_download(
+    song_url: &str,
+    count_in: bool,
+    transpose: i8,
+    selected_tracks: Vec<String>,
+    download_root: &Path,
+    song_destination: &Path,
+    policy: tasks::download_song::ExistingFilePolicy,
+) -> Result<()> {
+    use kv_core::c23_resume::{
+        checkpoint_http_completed_stem, ResumeJob, ResumeStore,
+    };
+
+    let domain = extract_domain_from_url(song_url)
+        .ok_or_else(|| anyhow!("Missing domain from URL"))?;
+
+    let staging =
+        tasks::download_song::create_download_staging_dir(download_root)?;
+    let lock = tasks::download_song::lock_new_kvui_staging_directory(&staging)?;
+
+    let result = (|| -> Result<()> {
+        let mut job = ResumeJob::new(
+            song_url,
+            song_destination,
+            count_in,
+            transpose,
+            selected_tracks.clone(),
+        )?;
+
+        let state_path = ResumeStore::default_path()?;
+        let mut store = ResumeStore::load(&state_path)?;
+
+        // Record the job before attempting its first track.
+        store.upsert(job.clone());
+        store.save(&state_path)?;
+
+        // The legacy tracker must not skip tracks based on stale records.
+        kv_core::download_progress::DownloadProgress::new()
+            .start_fresh_download(song_url, count_in, transpose)?;
+
+        let options = tasks::download_song::DownloadOptions {
+            count_in,
+            transpose,
+            selected_tracks: Some(selected_tracks),
+            force_restart: false,
+        };
+
+        tasks::download_song::download_song_http_with_hook(
+            song_url,
+            options,
+            Some(staging.to_string_lossy().into_owned()),
+            &domain,
+            &mut |track, file| {
+                checkpoint_http_completed_stem(
+                    file,
+                    &mut job,
+                    &mut store,
+                    &state_path,
+                    track,
+                    policy,
+                )
+            },
+        )?;
+
+        // Do not report success if selected stems remain unverified.
+        let pending = job.pending_tracks()?;
+        if !pending.is_empty() {
+            return Err(anyhow!(
+                "Download has {} unverified track(s): {}",
+                pending.len(),
+                pending.join(", ")
+            ));
+        }
+
+        Ok(())
+    })();
+
+    // C23 resume uses permanently saved files, not old staging data.
+    drop(lock);
+
+    if let Err(err) = fs::remove_dir_all(&staging) {
+        tracing::warn!(
+            "Could not remove temporary staging {}: {}",
+            staging.display(),
+            err
+        );
+
+        if result.is_ok() {
+            return Err(err.into());
+        }
+    }
+
+    result
+}
+
 fn extract_domain_from_url(url: &str) -> Option<String> {
     Url::parse(url)
         .ok()
@@ -3082,6 +3179,29 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                         let worker_song_destination = song_destination.clone();
                         let handle = std::thread::spawn(move || {
                             let _guard = LogScope::new(logs);
+                            if !use_browser {
+                                kvui_prepare_keyed_song_destination(
+                                    &worker_download_dir,
+                                    &song_artist,
+                                    &song_title,
+                                    &song_url,
+                                    key_shift,
+                                    &worker_song_destination,
+                                )?;
+
+                                return run_c23_http_download(
+                                    &song_url,
+                                    intro_click,
+                                    key_shift,
+                                    selected_tracks,
+                                    &worker_download_dir,
+                                    &worker_song_destination,
+                                    file_policy.ok_or_else(|| {
+                                        anyhow!("Missing download policy")
+                                    })?,
+                                );
+                            }
+
                             let prepared = prepare_staged_download(
                                 &song_url,
                                 use_browser,
