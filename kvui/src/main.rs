@@ -398,6 +398,9 @@ fn configure_demo_screen(app: &mut App, screen: DemoScreen) {
                 download_dir: dirs::home_dir()
                     .unwrap_or_else(|| PathBuf::from("~"))
                     .join("Downloads"),
+                c23_previously_verified: None,
+                c23_final_verified: None,
+                c23_report_issue: None,
             });
             if complete {
                 if let Some(download) = app.download.as_mut() {
@@ -1397,6 +1400,122 @@ fn render_download_status(frame: &mut ratatui::Frame, app: &mut App) {
     frame.render_widget(footer, chunks[1]);
 }
 
+/// Read only the C23 fingerprinted state for this exact HTTP request.
+/// Never infer verification from logs, filenames, or HTTP response codes.
+fn c23_verified_from_store(
+    store: &kv_core::c23_resume::ResumeStore,
+    song_url: &str,
+    destination: &Path,
+    count_in: bool,
+    transpose: i8,
+    selected_tracks: &[String],
+) -> Result<Option<std::collections::HashSet<String>>> {
+    let matching = store.jobs.iter().filter(|job| {
+        job.song_url == song_url
+            && job.destination == destination
+            && job.count_in == count_in
+            && job.transpose == transpose
+            && job.selected_tracks.len() == selected_tracks.len()
+            && selected_tracks.iter().all(|name| {
+                job.selected_tracks.iter().any(|saved| saved.eq_ignore_ascii_case(name))
+            })
+    }).collect::<Vec<_>>();
+
+    if matching.len() > 1 {
+        return Err(anyhow!("Multiple C23 records match the same download"));
+    }
+    let Some(job) = matching.first() else {
+        return Ok(None);
+    };
+    let pending = job.pending_tracks()?
+        .into_iter()
+        .map(|name| name.to_lowercase())
+        .collect::<std::collections::HashSet<_>>();
+    Ok(Some(selected_tracks.iter()
+        .map(|name| name.to_lowercase())
+        .filter(|name| !pending.contains(name))
+        .collect()))
+}
+
+fn c23_verified_snapshot(
+    song_url: &str,
+    destination: &Path,
+    count_in: bool,
+    transpose: i8,
+    selected_tracks: &[String],
+) -> Result<Option<std::collections::HashSet<String>>> {
+    use kv_core::c23_resume::ResumeStore;
+    let store = ResumeStore::load(&ResumeStore::default_path()?)?;
+    c23_verified_from_store(&store, song_url, destination, count_in, transpose, selected_tracks)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct C23CompletionCounts {
+    previously_verified: usize,
+    newly_verified: usize,
+    failed: usize,
+    pending: usize,
+}
+
+fn c23_completion_counts(download: &DownloadState) -> Option<C23CompletionCounts> {
+    let previous = download.c23_previously_verified.as_ref()?;
+    let final_verified = download.c23_final_verified.as_ref()?;
+    let mut counts = C23CompletionCounts {
+        previously_verified: 0, newly_verified: 0, failed: 0, pending: 0,
+    };
+    for track in &download.tracks {
+        let key = track.name.to_lowercase();
+        if final_verified.contains(&key) {
+            if previous.contains(&key) {
+                counts.previously_verified += 1;
+            } else {
+                counts.newly_verified += 1;
+            }
+        } else if track.status == TrackStatus::Failed {
+            counts.failed += 1;
+        } else {
+            counts.pending += 1;
+        }
+    }
+    Some(counts)
+}
+
+/// After the worker exits, reconcile its display against the verified C23
+/// journal. Does not change download/publishing behavior or any saved files.
+fn c23_finish_completion_report(download: &mut DownloadState) {
+    if download.c23_previously_verified.is_none() {
+        return; // Chromium uses its existing status behavior.
+    }
+    let selected = download.tracks.iter()
+        .map(|track| track.name.clone())
+        .collect::<Vec<_>>();
+    match c23_verified_snapshot(
+        &download.song.url, &download.download_dir,
+        download.count_in, download.transpose, &selected,
+    ) {
+        Ok(Some(verified)) => {
+            for track in &mut download.tracks {
+                if verified.contains(&track.name.to_lowercase()) {
+                    track.status = TrackStatus::Done;
+                } else if track.status == TrackStatus::Done {
+                    track.status = TrackStatus::Pending;
+                }
+            }
+            download.c23_final_verified = Some(verified);
+        }
+        Ok(None) => {
+            download.c23_report_issue = Some(
+                "No matching C23 verification record; completion totals unavailable".to_string()
+            );
+        }
+        Err(err) => {
+            download.c23_report_issue = Some(format!(
+                "Could not verify completion totals: {err}"
+            ));
+        }
+    }
+}
+
 fn render_download_done(frame: &mut ratatui::Frame, app: &mut App) {
     let Some(download) = &app.download else {
         return;
@@ -1440,27 +1559,59 @@ fn render_download_done(frame: &mut ratatui::Frame, app: &mut App) {
         download.download_dir.display()
     )));
     lines.push(Line::from(""));
-    let completed = download
-        .tracks
-        .iter()
-        .filter(|track| track.status == TrackStatus::Done)
-        .count();
-    let failed = download
-        .tracks
-        .iter()
-        .filter(|track| track.status == TrackStatus::Failed)
-        .count();
-    lines.push(Line::from(format!(
-        "Tracks: {} completed, {} failed",
-        completed, failed
-    )));
-    for track in &download.tracks {
-        let marker = match track.status {
-            TrackStatus::Done => "✓",
-            TrackStatus::Failed => "✗",
-            _ => "-",
-        };
-        lines.push(Line::from(format!("  {} {}", marker, track.name)));
+    if download.c23_previously_verified.is_some() {
+        if let Some(counts) = c23_completion_counts(download) {
+            lines.push(Line::from(format!(
+                "Verified: {} of {} | Failed: {} | Pending: {}",
+                counts.previously_verified + counts.newly_verified,
+                download.tracks.len(), counts.failed, counts.pending
+            )));
+            lines.push(Line::from(format!(
+                "Previously verified: {} | Newly downloaded: {}",
+                counts.previously_verified, counts.newly_verified
+            )));
+            let previous = download.c23_previously_verified.as_ref().unwrap();
+            let verified = download.c23_final_verified.as_ref().unwrap();
+            for track in &download.tracks {
+                let key = track.name.to_lowercase();
+                let label = if verified.contains(&key) {
+                    if previous.contains(&key) { "previously verified" } else { "downloaded" }
+                } else if track.status == TrackStatus::Failed {
+                    "failed"
+                } else {
+                    "pending"
+                };
+                let marker = if verified.contains(&key) {
+                    "✓"
+                } else if track.status == TrackStatus::Failed {
+                    "✗"
+                } else {
+                    "-"
+                };
+                lines.push(Line::from(format!("  {} {} ({})", marker, track.name, label)));
+            }
+        } else {
+            lines.push(Line::from(Span::styled(
+                download.c23_report_issue.as_deref()
+                    .unwrap_or("C23 verification summary unavailable"),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+    } else {
+        // Preserve the existing Chromium summary; it has no C23 journal.
+        let completed = download.tracks.iter()
+            .filter(|track| track.status == TrackStatus::Done).count();
+        let failed = download.tracks.iter()
+            .filter(|track| track.status == TrackStatus::Failed).count();
+        lines.push(Line::from(format!("Tracks: {} completed, {} failed", completed, failed)));
+        for track in &download.tracks {
+            let marker = match track.status {
+                TrackStatus::Done => "✓",
+                TrackStatus::Failed => "✗",
+                _ => "-",
+            };
+            lines.push(Line::from(format!("  {} {}", marker, track.name)));
+        }
     }
 
     let details = Paragraph::new(Text::from(lines))
@@ -2292,6 +2443,9 @@ fn update_download_state(app: &mut App) {
     let Some(download) = app.download.as_mut() else {
         return;
     };
+    if download.done.is_some() {
+        return; // Final results must not be overwritten by later log parsing.
+    }
 
     // Completion is determined by the protected download worker,
     // not by saved progress from earlier download requests.
@@ -2354,6 +2508,7 @@ fn update_download_state(app: &mut App) {
                     app.screen = Screen::DownloadDone;
                 }
             }
+            c23_finish_completion_report(download);
         }
     }
 }
@@ -2508,6 +2663,10 @@ struct DownloadState {
     started_at: Instant,
     duration: Option<Duration>,
     download_dir: std::path::PathBuf,
+    // None for Chromium; HTTP uses the persistent verified-stem journal.
+    c23_previously_verified: Option<std::collections::HashSet<String>>,
+    c23_final_verified: Option<std::collections::HashSet<String>>,
+    c23_report_issue: Option<String>,
 }
 
 struct LogBuffer {
@@ -3559,6 +3718,34 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                                 return Ok(false);
                             }
                         };
+                        let c23_previously_verified = if use_browser {
+                            None
+                        } else if resume {
+                            match c23_verified_snapshot(
+                                &song.url, &song_destination,
+                                intro_click, key_shift, &selected_tracks,
+                            ) {
+                                Ok(Some(verified)) if verified.len() < selected_tracks.len() => {
+                                    Some(verified)
+                                }
+                                Ok(_) => {
+                                    app.status = "Resume is no longer available for this selection".to_string();
+                                    return Ok(false);
+                                }
+                                Err(err) => {
+                                    app.status = format!("Cannot verify Resume state: {err}");
+                                    return Ok(false);
+                                }
+                            }
+                        } else {
+                            Some(std::collections::HashSet::new())
+                        };
+
+                        // UI log history must not mislabel tracks in a later attempt.
+                        if let Ok(mut buffer) = app.logs.lock() {
+                            buffer.lines.clear();
+                            buffer.partial.clear();
+                        }
                         let download_tracks = selected_tracks
                             .iter()
                             .map(|name| TrackStatusItem {
@@ -3661,6 +3848,9 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                             started_at: Instant::now(),
                             duration: None,
                             download_dir: song_destination,
+                            c23_previously_verified,
+                            c23_final_verified: None,
+                            c23_report_issue: None,
                         });
                         app.screen = Screen::DownloadStatus;
                     }
@@ -5142,5 +5332,133 @@ mod keyed_song_destination_tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod c23_completion_reporting_tests {
+    use super::*;
+    use kv_core::c23_resume::{ResumeJob, ResumeStore};
+    use std::collections::HashSet;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root() -> PathBuf {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)
+            .unwrap().as_nanos();
+        std::env::temp_dir().join(format!("kvui-c23-report-{}-{unique}", std::process::id()))
+    }
+
+    fn make_download(
+        root: &Path,
+        previously: &[&str],
+        verified: &[&str],
+        statuses: &[TrackStatus],
+    ) -> DownloadState {
+        let names = ["Drum Kit", "Bass", "Acoustic Guitar", "Electric Guitar"];
+        DownloadState {
+            song: Song {
+                title: "Take It Easy".into(), artist: "Eagles".into(),
+                url: "https://example.test/song".into(),
+                first_seen: 0, purchase_date: 0,
+            },
+            count_in: true, transpose: 0,
+            tracks: names.iter().zip(statuses.iter()).map(|(name, status)| {
+                TrackStatusItem { name: (*name).into(), status: status.clone(), attempt: 0 }
+            }).collect(),
+            handle: None, done: Some(Ok(())),
+            started_at: Instant::now(), duration: None,
+            download_dir: root.to_path_buf(),
+            c23_previously_verified: Some(previously.iter().map(|s| s.to_lowercase()).collect()),
+            c23_final_verified: Some(verified.iter().map(|s| s.to_lowercase()).collect()),
+            c23_report_issue: None,
+        }
+    }
+
+    #[test]
+    fn resume_success_counts_previously_and_newly_verified() {
+        let root = temp_root();
+        let prior = ["Drum Kit", "Acoustic Guitar", "Electric Guitar"];
+        let all = ["Drum Kit", "Bass", "Acoustic Guitar", "Electric Guitar"];
+        let state = make_download(&root, &prior, &all,
+            &[TrackStatus::Done, TrackStatus::Done, TrackStatus::Done, TrackStatus::Done]);
+        assert_eq!(c23_completion_counts(&state), Some(C23CompletionCounts {
+            previously_verified: 3, newly_verified: 1, failed: 0, pending: 0,
+        }));
+    }
+
+    #[test]
+    fn failed_resume_does_not_hide_saved_stems() {
+        let root = temp_root();
+        let prior = ["Drum Kit", "Acoustic Guitar", "Electric Guitar"];
+        let state = make_download(&root, &prior, &prior,
+            &[TrackStatus::Done, TrackStatus::Failed, TrackStatus::Done, TrackStatus::Done]);
+        assert_eq!(c23_completion_counts(&state), Some(C23CompletionCounts {
+            previously_verified: 3, newly_verified: 0, failed: 1, pending: 0,
+        }));
+    }
+
+    #[test]
+    fn pending_is_not_misreported_as_failed() {
+        let root = temp_root();
+        let prior = ["Drum Kit"];
+        let state = make_download(&root, &prior, &prior,
+            &[TrackStatus::Done, TrackStatus::Failed, TrackStatus::Pending, TrackStatus::Pending]);
+        assert_eq!(c23_completion_counts(&state), Some(C23CompletionCounts {
+            previously_verified: 1, newly_verified: 0, failed: 1, pending: 2,
+        }));
+    }
+
+    #[test]
+    fn fresh_download_counts_only_newly_verified() {
+        let root = temp_root();
+        let newly = ["Drum Kit", "Bass"];
+        let state = make_download(&root, &[], &newly,
+            &[TrackStatus::Done, TrackStatus::Done, TrackStatus::Pending, TrackStatus::Pending]);
+        assert_eq!(c23_completion_counts(&state), Some(C23CompletionCounts {
+            previously_verified: 0, newly_verified: 2, failed: 0, pending: 2,
+        }));
+    }
+
+    #[test]
+    fn invalidated_previously_verified_stem_is_not_counted() {
+        let root = temp_root();
+        let prior = ["Drum Kit", "Acoustic Guitar"];
+        let actually_verified = ["Drum Kit"];
+        let state = make_download(&root, &prior, &actually_verified,
+            &[TrackStatus::Done, TrackStatus::Pending, TrackStatus::Pending, TrackStatus::Pending]);
+        assert_eq!(c23_completion_counts(&state), Some(C23CompletionCounts {
+            previously_verified: 1, newly_verified: 0, failed: 0, pending: 3,
+        }));
+    }
+
+    #[test]
+    fn journal_snapshot_only_counts_hash_verified_exact_request() -> Result<()> {
+        let root = temp_root();
+        fs::create_dir_all(&root)?;
+        let drum = root.join("Drum Kit.mp3");
+        fs::write(&drum, b"known good")?;
+        let names = vec!["Drum Kit".into(), "Bass".into()];
+        let mut job = ResumeJob::new("https://example.test/song", &root, true, 0, names.clone())?;
+        job.record_completed("Drum Kit", &drum)?;
+        let mut store = ResumeStore::default();
+        store.upsert(job);
+
+        let snapshot = c23_verified_from_store(
+            &store, "https://example.test/song", &root, true, 0, &names
+        )?.unwrap();
+        assert_eq!(snapshot, HashSet::from(["drum kit".to_string()]));
+        assert!(c23_verified_from_store(
+            &store, "https://example.test/another", &root, true, 0, &names
+        )?.is_none());
+        assert!(c23_verified_from_store(
+            &store, "https://example.test/song", &root, true, 1, &names
+        )?.is_none());
+
+        fs::write(&drum, b"changed data")?;
+        assert!(c23_verified_from_store(
+            &store, "https://example.test/song", &root, true, 0, &names
+        )?.unwrap().is_empty());
+        fs::remove_dir_all(&root)?;
+        Ok(())
     }
 }
