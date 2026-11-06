@@ -380,3 +380,172 @@ mod state_tests {
         Ok(())
     }
 }
+
+/// Publish one verified stem and persist its completion record.
+pub fn publish_and_checkpoint_stem(
+    staged: &Path,
+    job: &mut ResumeJob,
+    store: &mut ResumeStore,
+    state_path: &Path,
+    track: &str,
+    policy: crate::tasks::download_song::ExistingFilePolicy,
+) -> Result<crate::tasks::download_song::PublishOutcome> {
+    use crate::tasks::download_song::{
+        publish_single_staged_track, PublishOutcome,
+    };
+
+    ensure!(
+        job.selected_tracks.iter().any(|name| name == track),
+        "Track was not selected: {}",
+        track
+    );
+
+    ensure!(
+        job.destination.is_dir(),
+        "Destination directory does not exist"
+    );
+
+    let filename = staged
+        .file_name()
+        .ok_or_else(|| anyhow!("Missing staged filename"))?;
+
+    let outcome = publish_single_staged_track(
+        staged,
+        &job.destination,
+        track,
+        job.transpose,
+        policy,
+    )?;
+
+    // An existing file that was merely kept is not proof
+    // that this download completed successfully.
+    if outcome == PublishOutcome::KeptExisting {
+        return Ok(outcome);
+    }
+
+    let published = job.destination.join(filename);
+
+    job.record_completed(track, &published)?;
+
+    store.upsert(job.clone());
+    store.save(state_path)?;
+
+    Ok(outcome)
+}
+
+#[cfg(test)]
+mod c23_checkpoint_tests {
+    use super::*;
+    use crate::tasks::download_song::{
+        ExistingFilePolicy, PublishOutcome,
+    };
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_root() -> Result<PathBuf> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+
+        Ok(std::env::temp_dir().join(format!(
+            "c23-checkpoint-{}-{unique}",
+            std::process::id()
+        )))
+    }
+
+    #[test]
+    fn published_stem_is_recorded_and_recoverable() -> Result<()> {
+        let root = test_root()?;
+        let staging = root.join("staging");
+        let destination = root.join("destination");
+
+        fs::create_dir_all(&staging)?;
+        fs::create_dir_all(&destination)?;
+
+        let filename =
+            "Don_Henley_Dirty_Laundry(Synth_Bass_Custom_Backing_Track).mp3";
+
+        let source = staging.join(filename);
+        fs::write(&source, b"verified test audio")?;
+
+        let mut job = ResumeJob::new(
+            "https://example.com/song",
+            &destination,
+            false,
+            0,
+            vec!["Synth Bass".into(), "Drum Kit".into()],
+        )?;
+
+        let mut store = ResumeStore::default();
+        let state = root.join("resume.json");
+
+        let outcome = publish_and_checkpoint_stem(
+            &source,
+            &mut job,
+            &mut store,
+            &state,
+            "Synth Bass",
+            ExistingFilePolicy::Keep,
+        )?;
+
+        assert_eq!(outcome, PublishOutcome::Created);
+        assert!(!source.exists());
+        assert!(destination.join(filename).exists());
+
+        let restored = ResumeStore::load(&state)?;
+        assert_eq!(restored.jobs.len(), 1);
+        assert_eq!(
+            restored.jobs[0].pending_tracks()?,
+            vec!["Drum Kit"]
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn keeping_existing_file_does_not_claim_new_completion() -> Result<()> {
+        let root = test_root()?;
+        let staging = root.join("staging");
+        let destination = root.join("destination");
+
+        fs::create_dir_all(&staging)?;
+        fs::create_dir_all(&destination)?;
+
+        let filename =
+            "Don_Henley_Dirty_Laundry(Synth_Bass_Custom_Backing_Track).mp3";
+
+        fs::write(destination.join(filename), b"existing audio")?;
+
+        let source = staging.join(filename);
+        fs::write(&source, b"replacement audio")?;
+
+        let mut job = ResumeJob::new(
+            "https://example.com/song",
+            &destination,
+            false,
+            0,
+            vec!["Synth Bass".into()],
+        )?;
+
+        let mut store = ResumeStore::default();
+        let state = root.join("resume.json");
+
+        let outcome = publish_and_checkpoint_stem(
+            &source,
+            &mut job,
+            &mut store,
+            &state,
+            "Synth Bass",
+            ExistingFilePolicy::Keep,
+        )?;
+
+        assert_eq!(outcome, PublishOutcome::KeptExisting);
+        assert_eq!(fs::read(destination.join(filename))?, b"existing audio");
+        assert!(source.exists());
+        assert!(job.completed.is_empty());
+        assert!(!state.exists());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+}
