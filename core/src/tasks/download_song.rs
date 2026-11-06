@@ -704,6 +704,24 @@ pub fn download_song_http(
     download_path: Option<String>,
     domain: &str,
 ) -> Result<()> {
+    download_song_http_with_hook(
+        url, options, download_path, domain,
+        &mut |_, path| Ok(path.to_path_buf()),
+    )
+}
+
+/// C23: Report each accepted HTTP stem to an optional publication hook.
+/// The hook returns the retained file path for duplicate-audio checking.
+pub fn download_song_http_with_hook(
+    url: &str,
+    options: DownloadOptions,
+    download_path: Option<String>,
+    domain: &str,
+    on_track_completed: &mut dyn FnMut(
+        &str,
+        &std::path::Path,
+    ) -> Result<PathBuf>,
+) -> Result<()> {
     let progress = DownloadProgress::new_with_path(download_path.as_deref());
     if options.force_restart {
         tracing::info!("Force restart requested, clearing previous progress");
@@ -867,11 +885,27 @@ pub fn download_song_http(
                     }
 
                     tracing::info!("Downloaded '{}'", decoded);
+
+                    // C23: Allow the caller to publish and checkpoint
+                    // this accepted stem before continuing.
+                    let retained_path =
+                        on_track_completed(track_name, &file_path)?;
+
+                    if !retained_path.is_file() {
+                        return Err(anyhow!(
+                            "Completed stem path is unavailable: {}",
+                            retained_path.display()
+                        ));
+                    }
+
                     progress.mark_track_downloaded(track_name)?;
                     if let Some(etag) = etag {
                         accepted_etags.insert(etag);
                     }
-                    downloaded_files.push(file_path);
+
+                    // Keep duplicate-audio detection working after
+                    // the callback moves a file out of staging.
+                    downloaded_files.push(retained_path);
                     completed = true;
                     break;
                 }
