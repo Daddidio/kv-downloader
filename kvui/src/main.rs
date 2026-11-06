@@ -1614,6 +1614,21 @@ fn start_download(
     Ok(())
 }
 
+/// Remove abandoned temporary staging folders before starting a download.
+/// Active folders and unmarked legacy folders are left untouched.
+fn cleanup_abandoned_staging_before_download(download_root: &Path) -> Result<()> {
+    let summary = tasks::download_song::cleanup_abandoned_kvui_staging_folders(download_root)?;
+    tracing::info!(
+        "Pre-download staging cleanup: {} removed, {} active, {} legacy, {} unsafe, {} errors",
+        summary.removed,
+        summary.skipped_active,
+        summary.skipped_legacy,
+        summary.skipped_unsafe,
+        summary.errors
+    );
+    Ok(())
+}
+
 #[allow(dead_code)]
 struct PreparedDownload {
     staging_dir: PathBuf,
@@ -1631,6 +1646,7 @@ fn prepare_staged_download(
     selected_tracks: Vec<String>,
     destination_dir: &Path,
 ) -> Result<PreparedDownload> {
+    cleanup_abandoned_staging_before_download(destination_dir)?;
     let staging_dir =
         tasks::download_song::create_download_staging_dir(destination_dir)?;
 
@@ -1721,6 +1737,7 @@ fn run_c23_http_download(
     let domain = extract_domain_from_url(song_url)
         .ok_or_else(|| anyhow!("Missing domain from URL"))?;
 
+    cleanup_abandoned_staging_before_download(download_root)?;
     let staging =
         tasks::download_song::create_download_staging_dir(download_root)?;
     let lock = tasks::download_song::lock_new_kvui_staging_directory(&staging)?;

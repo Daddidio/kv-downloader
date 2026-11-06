@@ -2831,10 +2831,32 @@ fn kvui_cleanup_reparse_point(metadata: &std::fs::Metadata) -> bool {
     false
 }
 
+/// Reject reparse points and unusual filesystem objects anywhere in a
+/// staging tree. Ordinary nested temporary directories are disposable.
+fn kvui_staging_tree_is_safe(folder: &std::path::Path) -> Result<bool> {
+    use std::fs;
+
+    for entry in fs::read_dir(folder)? {
+        let path = entry?.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if kvui_cleanup_reparse_point(&metadata) {
+            return Ok(false);
+        }
+        if metadata.is_dir() {
+            if !kvui_staging_tree_is_safe(&path)? {
+                return Ok(false);
+            }
+        } else if !metadata.is_file() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Clean one abandoned, lock-protected staging folder.
 ///
 /// Legacy folders and active downloads are never deleted.
-/// The caller must obtain explicit user confirmation before calling.
+/// Used for both confirmed manual cleanup and pre-download automatic cleanup.
 pub fn cleanup_kvui_staging_directory(
     destination_dir: &std::path::Path,
     folder: &std::path::Path,
@@ -2906,30 +2928,32 @@ pub fn cleanup_kvui_staging_directory(
         return Ok(KvuiCleanupResult::SkippedUnsafe);
     }
 
-    // Inspect everything before removing anything.
-    // Nested folders, links and unusual filesystem objects require
-    // manual review rather than recursive deletion.
-    let mut removable_files = Vec::new();
-
-    for entry in fs::read_dir(folder)? {
-        let entry = entry?;
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)?;
-
-        if !metadata.is_file()
-            || kvui_cleanup_reparse_point(&metadata)
-        {
-            return Ok(KvuiCleanupResult::SkippedUnsafe);
-        }
-
-        if entry.file_name() != std::ffi::OsStr::new(KVUI_STAGING_LOCK_FILE) {
-            removable_files.push(path);
-        }
+    // Inspect the entire tree before deleting. Never traverse links,
+    // junctions or unusual filesystem objects outside KVUI's staging area.
+    if !kvui_staging_tree_is_safe(folder)? {
+        return Ok(KvuiCleanupResult::SkippedUnsafe);
     }
 
-    // The download lock remains held while ordinary files are removed.
-    for path in removable_files {
-        fs::remove_file(path)?;
+    // Keep the abandonment lock held while removing ordinary contents.
+    // Rust's remove_dir_all does not follow directory symlinks; the
+    // preflight above also rejects reparse points inside the tree.
+    for entry in fs::read_dir(folder)? {
+        let entry = entry?;
+        if entry.file_name() == std::ffi::OsStr::new(KVUI_STAGING_LOCK_FILE) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if kvui_cleanup_reparse_point(&metadata) {
+            return Err(anyhow!("Staging contents changed during cleanup"));
+        }
+        if metadata.is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else if metadata.is_file() {
+            fs::remove_file(&path)?;
+        } else {
+            return Err(anyhow!("Unexpected filesystem object during staging cleanup"));
+        }
     }
 
     // Release the lock before removing its marker, for Windows.
@@ -2942,9 +2966,43 @@ pub fn cleanup_kvui_staging_directory(
     Ok(KvuiCleanupResult::Removed)
 }
 
+/// Summary of automatic cleanup before a fresh or resumed download.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct KvuiStagingCleanupSummary {
+    pub removed: usize,
+    pub skipped_active: usize,
+    pub skipped_legacy: usize,
+    pub skipped_unsafe: usize,
+    pub errors: usize,
+}
+
+/// Remove abandoned KVUI staging folders without touching active downloads.
+/// A missing lock cannot prove abandonment, so legacy folders remain untouched.
+/// Per-folder failures are logged and do not prevent a new download.
+pub fn cleanup_abandoned_kvui_staging_folders(
+    download_root: &std::path::Path,
+) -> Result<KvuiStagingCleanupSummary> {
+    let folders = list_kvui_staging_directories(download_root)?;
+    let mut summary = KvuiStagingCleanupSummary::default();
+    for folder in folders {
+        match cleanup_kvui_staging_directory(download_root, &folder) {
+            Ok(KvuiCleanupResult::Removed) => summary.removed += 1,
+            Ok(KvuiCleanupResult::SkippedActive) => summary.skipped_active += 1,
+            Ok(KvuiCleanupResult::SkippedLegacy) => summary.skipped_legacy += 1,
+            Ok(KvuiCleanupResult::SkippedUnsafe) => summary.skipped_unsafe += 1,
+            Err(err) => {
+                summary.errors += 1;
+                tracing::warn!("Staging cleanup failed for {}: {}", folder.display(), err);
+            }
+        }
+    }
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod staging_cleanup_tests {
     use super::{
+        cleanup_abandoned_kvui_staging_folders,
         cleanup_kvui_staging_directory,
         lock_new_kvui_staging_directory,
         KvuiCleanupResult,
@@ -3017,21 +3075,22 @@ mod staging_cleanup_tests {
     }
 
     #[test]
-    fn refuses_unexpected_nested_folders_and_invalid_names() {
+    fn removes_nested_temporary_files_but_refuses_invalid_names() {
         let root = test_root();
 
         let staging = root.join(".kvui-staging-123-456789-0");
         fs::create_dir(&staging).unwrap();
-        fs::create_dir(staging.join("unexpected")).unwrap();
+        fs::create_dir(staging.join("temporary")).unwrap();
+        fs::write(staging.join("temporary").join("partial.mp3"), b"partial").unwrap();
 
         let lock = lock_new_kvui_staging_directory(&staging).unwrap();
         drop(lock);
 
         assert_eq!(
             cleanup_kvui_staging_directory(&root, &staging).unwrap(),
-            KvuiCleanupResult::SkippedUnsafe
+            KvuiCleanupResult::Removed
         );
-        assert!(staging.join("unexpected").exists());
+        assert!(!staging.exists());
 
         let unrelated = root.join("CompletedSong");
         fs::create_dir(&unrelated).unwrap();
@@ -3042,6 +3101,39 @@ mod staging_cleanup_tests {
         );
         assert!(unrelated.exists());
 
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn automatic_cleanup_preserves_active_legacy_and_completed_files() {
+        let root = test_root();
+        let completed = root.join("Completed.mp3");
+        fs::write(&completed, b"completed stem").unwrap();
+
+        let abandoned = root.join(".kvui-staging-123-456791-0");
+        fs::create_dir(&abandoned).unwrap();
+        fs::write(abandoned.join("incomplete.mp3"), b"temporary").unwrap();
+        let abandoned_lock = lock_new_kvui_staging_directory(&abandoned).unwrap();
+        drop(abandoned_lock);
+
+        let active = root.join(".kvui-staging-123-456792-0");
+        fs::create_dir(&active).unwrap();
+        let held_lock = lock_new_kvui_staging_directory(&active).unwrap();
+
+        let legacy = root.join(".kvui-staging-123-456793-0");
+        fs::create_dir(&legacy).unwrap();
+
+        let summary = cleanup_abandoned_kvui_staging_folders(&root).unwrap();
+        assert_eq!(summary.removed, 1);
+        assert_eq!(summary.skipped_active, 1);
+        assert_eq!(summary.skipped_legacy, 1);
+        assert_eq!(summary.skipped_unsafe, 0);
+        assert_eq!(summary.errors, 0);
+        assert!(!abandoned.exists());
+        assert!(active.exists());
+        assert!(legacy.exists());
+        assert_eq!(fs::read(&completed).unwrap(), b"completed stem");
+
+        drop(held_lock);
         fs::remove_dir_all(root).unwrap();
     }
 }
