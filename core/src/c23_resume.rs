@@ -1,4 +1,4 @@
-﻿use anyhow::{anyhow, ensure, Result};
+use anyhow::{anyhow, ensure, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
@@ -264,6 +264,21 @@ impl ResumeStore {
         Ok(store)
     }
 
+    /// Find a matching unfinished job and verify its saved stems.
+    pub fn find_unfinished_match(
+        &self,
+        request: &ResumeJob,
+    ) -> Result<Option<ResumeJob>> {
+        for saved in &self.jobs {
+            if saved.same_request(request)
+                && !saved.pending_tracks()?.is_empty()
+            {
+                return Ok(Some(saved.clone()));
+            }
+        }
+
+        Ok(None)
+    }
     pub fn upsert(&mut self, job: ResumeJob) {
         if let Some(existing) = self.jobs.iter_mut()
             .find(|saved| saved.same_request(&job))
@@ -673,6 +688,82 @@ mod c23_http_checkpoint_tests {
         assert_eq!(fs::read(destination.join(filename))?, b"new audio");
         assert!(second_job.completed.is_empty());
         assert!(!second_state.exists());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+}
+
+
+#[cfg(test)]
+mod c23_resume_lookup_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn finds_only_matching_unfinished_downloads() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+
+        let root = std::env::temp_dir().join(format!(
+            "c23-lookup-{}-{unique}",
+            std::process::id()
+        ));
+
+        fs::create_dir_all(&root)?;
+
+        let bass = root.join("Bass.mp3");
+        fs::write(&bass, b"verified audio")?;
+
+        let mut job = ResumeJob::new(
+            "https://example.com/song",
+            &root,
+            false,
+            0,
+            vec!["Bass".into(), "Drums".into()],
+        )?;
+
+        job.record_completed("Bass", &bass)?;
+
+        let mut store = ResumeStore::default();
+        store.upsert(job.clone());
+
+        let found = store.find_unfinished_match(&job)?
+            .expect("Expected unfinished download");
+
+        assert_eq!(found.pending_tracks()?, vec!["Drums"]);
+
+        // Different key must not match.
+        let different_key = ResumeJob::new(
+            "https://example.com/song",
+            &root,
+            false,
+            -1,
+            vec!["Bass".into(), "Drums".into()],
+        )?;
+
+        assert!(store.find_unfinished_match(&different_key)?.is_none());
+
+        // Different track selection must not match.
+        let different_tracks = ResumeJob::new(
+            "https://example.com/song",
+            &root,
+            false,
+            0,
+            vec!["Bass".into()],
+        )?;
+
+        assert!(store.find_unfinished_match(&different_tracks)?.is_none());
+
+        // Completed jobs must no longer appear unfinished.
+        let drums = root.join("Drums.mp3");
+        fs::write(&drums, b"drum audio")?;
+
+        job.record_completed("Drums", &drums)?;
+        store.upsert(job.clone());
+
+        assert!(store.find_unfinished_match(&job)?.is_none());
 
         fs::remove_dir_all(root)?;
         Ok(())
