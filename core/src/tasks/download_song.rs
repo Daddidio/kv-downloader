@@ -2150,6 +2150,95 @@ mod safe_publish_tests {
 }
 
 
+/// C23: Publish one completed track independently of the download batch.
+pub fn publish_single_staged_track(
+    staged: &std::path::Path,
+    destination_dir: &std::path::Path,
+    requested_track: &str,
+    transpose: i8,
+    policy: ExistingFilePolicy,
+) -> Result<PublishOutcome> {
+    let filename = staged
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("Invalid staged filename"))?;
+
+    if !filename_matches_requested_track_key(
+        filename,
+        requested_track,
+        transpose,
+    ) {
+        return Err(anyhow!(
+            "Staged file does not match requested track '{}': {}",
+            requested_track,
+            filename
+        ));
+    }
+
+    publish_staged_file(staged, destination_dir, policy)
+}
+
+#[cfg(test)]
+mod c23_track_publication_tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn completed_stem_can_be_published_independently() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let root = std::env::temp_dir().join(
+            format!("c23-track-test-{}-{unique}", std::process::id())
+        );
+
+        let staging = root.join("staging");
+        let destination = root.join("destination");
+
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+
+        let filename =
+            "Don_Henley_Dirty_Laundry(Synth_Bass_Custom_Backing_Track).mp3";
+
+        let source = staging.join(filename);
+
+        fs::write(&source, b"test audio").unwrap();
+
+        assert!(publish_single_staged_track(
+            &source,
+            &destination,
+            "Drum Kit",
+            0,
+            ExistingFilePolicy::Keep,
+        ).is_err());
+
+        assert!(source.exists());
+
+        assert_eq!(
+            publish_single_staged_track(
+                &source,
+                &destination,
+                "Synth Bass",
+                0,
+                ExistingFilePolicy::Keep,
+            ).unwrap(),
+            PublishOutcome::Created
+        );
+
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read(destination.join(filename)).unwrap(),
+            b"test audio"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 /// Create a unique staging directory on the destination filesystem.
 pub fn create_download_staging_dir(
     destination_dir: &std::path::Path,
