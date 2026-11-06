@@ -1570,6 +1570,7 @@ fn render_download_done(frame: &mut ratatui::Frame, app: &mut App) {
                 "Previously verified: {} | Newly downloaded: {}",
                 counts.previously_verified, counts.newly_verified
             )));
+            lines.push(Line::from(""));
             let previous = download.c23_previously_verified.as_ref().unwrap();
             let verified = download.c23_final_verified.as_ref().unwrap();
             for track in &download.tracks {
