@@ -1655,6 +1655,7 @@ fn run_c23_http_download(
     count_in: bool,
     transpose: i8,
     selected_tracks: Vec<String>,
+    resume: bool,
     download_root: &Path,
     song_destination: &Path,
     policy: tasks::download_song::ExistingFilePolicy,
@@ -1671,7 +1672,7 @@ fn run_c23_http_download(
     let lock = tasks::download_song::lock_new_kvui_staging_directory(&staging)?;
 
     let result = (|| -> Result<()> {
-        let mut job = ResumeJob::new(
+        let request = ResumeJob::new(
             song_url,
             song_destination,
             count_in,
@@ -1681,6 +1682,9 @@ fn run_c23_http_download(
 
         let state_path = ResumeStore::default_path()?;
         let mut store = ResumeStore::load(&state_path)?;
+
+        // Plan before upsert so saved verified stems survive Resume.
+        let (mut job, tracks_to_download) = store.plan_download(request, resume)?;
 
         // Record the job before attempting its first track.
         store.upsert(job.clone());
@@ -1693,7 +1697,7 @@ fn run_c23_http_download(
         let options = tasks::download_song::DownloadOptions {
             count_in,
             transpose,
-            selected_tracks: Some(selected_tracks),
+            selected_tracks: Some(tracks_to_download),
             force_restart: false,
         };
 
@@ -3194,6 +3198,7 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                                     intro_click,
                                     key_shift,
                                     selected_tracks,
+                                    false, // 4C-1: existing UI remains fresh-download only
                                     &worker_download_dir,
                                     &worker_song_destination,
                                     file_policy.ok_or_else(|| {
