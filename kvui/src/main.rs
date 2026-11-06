@@ -188,6 +188,12 @@ impl App {
             return;
         }
 
+        // The C23 resume checkpoint is independent of temporary staging data.
+        // Clean abandoned folders before counting incomplete downloads.
+        if let Err(err) = cleanup_abandoned_staging(&self.download_dir) {
+            tracing::warn!("Pre-scan staging cleanup failed: {}", err);
+        }
+
         match tasks::download_song::list_kvui_staging_directories(
             &self.download_dir,
         ) {
@@ -502,6 +508,11 @@ fn run_tui(diagnostics_path: Option<PathBuf>, demo_screen: Option<DemoScreen>) -
         }
     }
 
+    if demo_screen.is_none() && app.download_dir.is_dir() {
+        if let Err(err) = cleanup_abandoned_staging(&app.download_dir) {
+            tracing::warn!("Shutdown staging cleanup failed: {}", err);
+        }
+    }
     restore_terminal(&mut terminal)?;
     Ok(())
 }
@@ -1614,12 +1625,12 @@ fn start_download(
     Ok(())
 }
 
-/// Remove abandoned temporary staging folders before starting a download.
-/// Active folders and unmarked legacy folders are left untouched.
-fn cleanup_abandoned_staging_before_download(download_root: &Path) -> Result<()> {
+/// Remove abandoned temporary staging folders using the existing lock-aware
+/// cleanup. Active and unmarked legacy folders are left untouched.
+fn cleanup_abandoned_staging(download_root: &Path) -> Result<()> {
     let summary = tasks::download_song::cleanup_abandoned_kvui_staging_folders(download_root)?;
     tracing::info!(
-        "Pre-download staging cleanup: {} removed, {} active, {} legacy, {} unsafe, {} errors",
+        "Staging cleanup: {} removed, {} active, {} legacy, {} unsafe, {} errors",
         summary.removed,
         summary.skipped_active,
         summary.skipped_legacy,
@@ -1646,7 +1657,7 @@ fn prepare_staged_download(
     selected_tracks: Vec<String>,
     destination_dir: &Path,
 ) -> Result<PreparedDownload> {
-    cleanup_abandoned_staging_before_download(destination_dir)?;
+    cleanup_abandoned_staging(destination_dir)?;
     let staging_dir =
         tasks::download_song::create_download_staging_dir(destination_dir)?;
 
@@ -1737,7 +1748,7 @@ fn run_c23_http_download(
     let domain = extract_domain_from_url(song_url)
         .ok_or_else(|| anyhow!("Missing domain from URL"))?;
 
-    cleanup_abandoned_staging_before_download(download_root)?;
+    cleanup_abandoned_staging(download_root)?;
     let staging =
         tasks::download_song::create_download_staging_dir(download_root)?;
     let lock = tasks::download_song::lock_new_kvui_staging_directory(&staging)?;
@@ -2955,6 +2966,41 @@ fn download_confirmation_labels(resume_available: bool) -> &'static [&'static st
 
 fn download_confirmation_cancel_index(resume_available: bool) -> usize {
     download_confirmation_labels(resume_available).len() - 1
+}
+
+#[cfg(test)]
+mod c23_staging_startup_cleanup_tests {
+    use super::{App, LogBuffer};
+    use kv_core::tasks::download_song::lock_new_kvui_staging_directory;
+    use std::fs;
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn startup_scan_removes_abandoned_folder_before_warning() {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "kvui-c23-startup-cleanup-{}-{stamp}", std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let stale = root.join(".kvui-staging-123-456789-0");
+        fs::create_dir(&stale).unwrap();
+        fs::write(stale.join("partial.mp3"), b"unfinished").unwrap();
+        let lock = lock_new_kvui_staging_directory(&stale).unwrap();
+        drop(lock);
+
+        let mut app = App::new(Arc::new(Mutex::new(LogBuffer::new(100))));
+        app.download_dir = root.clone();
+        app.scan_incomplete_downloads();
+        app.refresh_menu();
+        app.recovery_notice_open = !app.incomplete_folders.is_empty();
+
+        assert!(!stale.exists());
+        assert!(app.incomplete_folders.is_empty());
+        assert!(!app.recovery_notice_open);
+        assert!(!app.menu_items.iter().any(|item| item.starts_with("Incomplete Downloads (")));
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(test)]
