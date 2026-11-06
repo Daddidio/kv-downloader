@@ -919,11 +919,35 @@ fn handle_detail_keys(
                         app.status = "Select at least one track to download".to_string();
                         return Ok(false);
                     }
+                    // Resume is HTTP-only and requires an exact unfinished job.
+                    let resume_available = if app.use_browser {
+                        false
+                    } else {
+                        match c23_resume_is_available(
+                            &song,
+                            &selected_tracks,
+                            &app.download_dir,
+                            app.intro_click,
+                            app.key_shift,
+                        ) {
+                            Ok(available) => available,
+                            Err(err) => {
+                                app.status = format!("Cannot check resume availability: {err}");
+                                return Ok(false);
+                            }
+                        }
+                    };
                     app.confirm = Some(ConfirmState {
                         message: if app.use_browser {
                             vec![
                                 "This will open a visible Chromium browser.".to_string(),
                                 "Do not interact with the browser during downloading.".to_string(),
+                                "Continue?".to_string(),
+                            ]
+                        } else if resume_available {
+                            vec![
+                                "This will use the original HTTP downloader.".to_string(),
+                                "A matching unfinished download can be resumed.".to_string(),
                                 "Continue?".to_string(),
                             ]
                         } else {
@@ -939,6 +963,7 @@ fn handle_detail_keys(
                             use_browser: app.use_browser,
                             intro_click: app.intro_click,
                             key_shift: app.key_shift,
+                            resume_available,
                         },
                     });
                 }
@@ -1648,6 +1673,35 @@ fn prepare_staged_download(
         }
     }
 }
+/// Check whether the exact selected song, key, options and destination
+/// have a saved unfinished HTTP job with missing or unverified stems.
+fn c23_resume_is_available(
+    song: &Song,
+    selected_tracks: &[String],
+    download_root: &Path,
+    count_in: bool,
+    transpose: i8,
+) -> Result<bool> {
+    use kv_core::c23_resume::{ResumeJob, ResumeStore};
+
+    let destination = kvui_select_keyed_song_destination(
+        download_root,
+        &song.artist,
+        &song.title,
+        &song.url,
+        transpose,
+    )?;
+    let request = ResumeJob::new(
+        &song.url,
+        &destination,
+        count_in,
+        transpose,
+        selected_tracks.to_vec(),
+    )?;
+    let store = ResumeStore::load(&ResumeStore::default_path()?)?;
+    Ok(store.find_unfinished_match(&request)?.is_some())
+}
+
 /// C23: Publish accepted HTTP stems as each download completes.
 /// Preserve completed files even when a later track fails.
 fn run_c23_http_download(
@@ -2337,6 +2391,7 @@ enum ConfirmPayload {
         use_browser: bool,
         intro_click: bool,
         key_shift: i8,
+        resume_available: bool,
     },
     ResetSong {
         url: String,
@@ -2873,11 +2928,43 @@ fn render_recovery_details_overlay(frame: &mut ratatui::Frame, app: &App) {
 
     frame.render_widget(panel, area);
 }
+fn download_confirmation_labels(resume_available: bool) -> &'static [&'static str] {
+    if resume_available {
+        &[" KEEP EXISTING ", " REPLACE EXISTING ", " RESUME ", " CANCEL "]
+    } else {
+        &[" KEEP EXISTING ", " REPLACE EXISTING ", " CANCEL "]
+    }
+}
+
+fn download_confirmation_cancel_index(resume_available: bool) -> usize {
+    download_confirmation_labels(resume_available).len() - 1
+}
+
+#[cfg(test)]
+mod c23_resume_confirmation_tests {
+    use super::{download_confirmation_cancel_index, download_confirmation_labels};
+
+    #[test]
+    fn resume_choice_only_appears_for_matching_job() {
+        assert_eq!(download_confirmation_labels(false).len(), 3);
+        assert!(!download_confirmation_labels(false).contains(&" RESUME "));
+        assert_eq!(download_confirmation_cancel_index(false), 2);
+
+        assert_eq!(download_confirmation_labels(true).len(), 4);
+        assert_eq!(download_confirmation_labels(true)[2], " RESUME ");
+        assert_eq!(download_confirmation_cancel_index(true), 3);
+    }
+}
+
 fn render_confirm_overlay(frame: &mut ratatui::Frame, app: &App) {
     let Some(confirm) = &app.confirm else {
         return;
     };
-    let area = centered_rect(70, 30, frame.size());
+    let resume_available = match &confirm.payload {
+        ConfirmPayload::StartDownload { resume_available, .. } => *resume_available,
+        _ => false,
+    };
+    let area = centered_rect(if resume_available { 90 } else { 70 }, 35, frame.size());
     frame.render_widget(Clear, area);
 
     let mut lines = vec![Line::from(Span::styled(
@@ -2894,7 +2981,7 @@ fn render_confirm_overlay(frame: &mut ratatui::Frame, app: &App) {
         matches!(&confirm.payload, ConfirmPayload::StartDownload { .. });
 
     let labels: &[&str] = if download_confirm {
-        &[" KEEP EXISTING ", " REPLACE EXISTING ", " CANCEL "]
+        download_confirmation_labels(resume_available)
     } else {
         &[" YES ", " NO "]
     };
@@ -2905,6 +2992,7 @@ fn render_confirm_overlay(frame: &mut ratatui::Frame, app: &App) {
         let color = match (download_confirm, index) {
             (true, 0) => Color::Green,
             (true, 1) => Color::Yellow,
+            (true, 2) if resume_available => Color::Cyan,
             (_, 0) => Color::Green,
             _ => Color::Red,
         };
@@ -3088,13 +3176,11 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
     };
     match key.code {
         KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-            let count = if matches!(
-                &confirm.payload,
-                ConfirmPayload::StartDownload { .. }
-            ) {
-                3
-            } else {
-                2
+            let count = match &confirm.payload {
+                ConfirmPayload::StartDownload { resume_available, .. } => {
+                    download_confirmation_labels(*resume_available).len()
+                }
+                _ => 2,
             };
 
             confirm.selected = match key.code {
@@ -3108,13 +3194,21 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
         KeyCode::Enter => {
             let confirm = app.confirm.take().unwrap();
 
+            let resume_available = match &confirm.payload {
+                ConfirmPayload::StartDownload { resume_available, .. } => *resume_available,
+                _ => false,
+            };
             let is_download_confirm =
                 matches!(&confirm.payload, ConfirmPayload::StartDownload { .. });
 
-            if is_download_confirm && confirm.selected == 2 {
+            if is_download_confirm
+                && confirm.selected == download_confirmation_cancel_index(resume_available)
+            {
                 return Ok(false);
             }
 
+            let resume = is_download_confirm && resume_available && confirm.selected == 2;
+            // Resume replaces only missing or invalid tracks selected by C23 planning.
             let file_policy = if is_download_confirm {
                 Some(if confirm.selected == 0 {
                     tasks::download_song::ExistingFilePolicy::Keep
@@ -3138,6 +3232,7 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                         use_browser,
                         intro_click,
                         key_shift,
+                        resume_available: _,
                     } => {
                         app.log_scroll = 0;
                         app.log_follow = true;
@@ -3198,7 +3293,7 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                                     intro_click,
                                     key_shift,
                                     selected_tracks,
-                                    false, // 4C-1: existing UI remains fresh-download only
+                                    resume,
                                     &worker_download_dir,
                                     &worker_song_destination,
                                     file_policy.ok_or_else(|| {
