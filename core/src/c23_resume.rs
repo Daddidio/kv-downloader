@@ -549,3 +549,132 @@ mod c23_checkpoint_tests {
         Ok(())
     }
 }
+
+/// Publish an accepted HTTP stem and return its retained location.
+/// The caller uses that location for subsequent duplicate-audio checks.
+pub fn checkpoint_http_completed_stem(
+    staged: &Path,
+    job: &mut ResumeJob,
+    store: &mut ResumeStore,
+    state_path: &Path,
+    track: &str,
+    policy: crate::tasks::download_song::ExistingFilePolicy,
+) -> Result<PathBuf> {
+    use crate::tasks::download_song::PublishOutcome;
+
+    let filename = staged
+        .file_name()
+        .ok_or_else(|| anyhow!("Missing staged filename"))?
+        .to_owned();
+
+    let outcome = publish_and_checkpoint_stem(
+        staged,
+        job,
+        store,
+        state_path,
+        track,
+        policy,
+    )?;
+
+    match outcome {
+        PublishOutcome::Created | PublishOutcome::Replaced => {
+            Ok(job.destination.join(filename))
+        }
+        PublishOutcome::KeptExisting => {
+            // Retain the staged copy for duplicate-audio checking.
+            // The existing destination was not newly verified.
+            Ok(staged.to_path_buf())
+        }
+    }
+}
+
+#[cfg(test)]
+mod c23_http_checkpoint_tests {
+    use super::*;
+    use crate::tasks::download_song::ExistingFilePolicy;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn completion_returns_correct_retained_file_path() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos();
+
+        let root = std::env::temp_dir().join(format!(
+            "c23-http-checkpoint-{}-{unique}",
+            std::process::id()
+        ));
+
+        let staging = root.join("staging");
+        let destination = root.join("destination");
+
+        fs::create_dir_all(&staging)?;
+        fs::create_dir_all(&destination)?;
+
+        let filename =
+            "Don_Henley_Dirty_Laundry(Synth_Bass_Custom_Backing_Track).mp3";
+
+        let source = staging.join(filename);
+        fs::write(&source, b"new audio")?;
+
+        let mut job = ResumeJob::new(
+            "https://example.com/song",
+            &destination,
+            false,
+            0,
+            vec!["Synth Bass".into()],
+        )?;
+
+        let mut store = ResumeStore::default();
+        let state = root.join("resume.json");
+
+        let retained = checkpoint_http_completed_stem(
+            &source,
+            &mut job,
+            &mut store,
+            &state,
+            "Synth Bass",
+            ExistingFilePolicy::Keep,
+        )?;
+
+        assert_eq!(retained, destination.join(filename));
+        assert!(retained.exists());
+        assert!(!source.exists());
+
+        let restored = ResumeStore::load(&state)?;
+        assert!(restored.jobs[0].pending_tracks()?.is_empty());
+
+        // A second request with Keep Existing must preserve
+        // the existing destination and retain the staged copy.
+        fs::write(&source, b"replacement audio")?;
+
+        let mut second_job = ResumeJob::new(
+            "https://example.com/another-song",
+            &destination,
+            false,
+            0,
+            vec!["Synth Bass".into()],
+        )?;
+
+        let mut second_store = ResumeStore::default();
+        let second_state = root.join("second-resume.json");
+
+        let retained = checkpoint_http_completed_stem(
+            &source,
+            &mut second_job,
+            &mut second_store,
+            &second_state,
+            "Synth Bass",
+            ExistingFilePolicy::Keep,
+        )?;
+
+        assert_eq!(retained, source);
+        assert!(source.exists());
+        assert_eq!(fs::read(destination.join(filename))?, b"new audio");
+        assert!(second_job.completed.is_empty());
+        assert!(!second_state.exists());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+}
