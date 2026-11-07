@@ -99,6 +99,8 @@ struct App {
     songs: Vec<Song>,
     all_songs: Vec<Song>,
     songs_state: ListState,
+    // Visual rows include blank separators, while songs_state retains real song indices.
+    songs_display_state: ListState,
     songs_mode: SongsMode,
     song_sort: SongSort,
     song_filter: String,
@@ -140,6 +142,7 @@ impl App {
             songs: Vec::new(),
             all_songs: Vec::new(),
             songs_state: ListState::default(),
+            songs_display_state: ListState::default(),
             songs_mode: SongsMode::Browse,
             song_sort: SongSort::DateDescending,
             song_filter: String::new(),
@@ -762,6 +765,22 @@ fn apply_song_view(app: &mut App) {
     }
 }
 
+/// Cycle the sort order while retaining the same highlighted song when present.
+fn cycle_song_sort_preserving_selection(app: &mut App) {
+    let selected_url = app.songs_state.selected()
+        .and_then(|index| app.songs.get(index))
+        .map(|song| song.url.clone());
+
+    app.song_sort = app.song_sort.next();
+    apply_song_view(app);
+
+    if let Some(url) = selected_url {
+        if let Some(index) = app.songs.iter().position(|song| song.url == url) {
+            app.songs_state.select(Some(index));
+        }
+    }
+}
+
 fn handle_songs_keys(
     _terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
@@ -809,12 +828,8 @@ fn handle_songs_keys(
                 app.songs_state.select(Some(next));
             }
         }
-        KeyCode::Char('/') => {
-            app.editing_song_filter = true;
-        }
-        KeyCode::Char('s') => {
-            app.song_sort = app.song_sort.next();
-            apply_song_view(app);
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            cycle_song_sort_preserving_selection(app);
         }
         KeyCode::Enter => {
             if let Some(idx) = app.songs_state.selected() {
@@ -849,6 +864,20 @@ fn handle_songs_keys(
     Ok(false)
 }
 
+/// Change all track checkboxes only while the track pane has focus.
+fn bulk_select_tracks(app: &mut App, selected: bool) {
+    if app.detail_focus == DetailFocus::Tracks {
+        for track in &mut app.tracks {
+            track.selected = selected;
+        }
+    }
+}
+
+fn back_from_song_details(app: &mut App) {
+    app.screen = Screen::Songs;
+    app.status.clear();
+}
+
 fn handle_detail_keys(
     _terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
@@ -860,8 +889,7 @@ fn handle_detail_keys(
 
     match key.code {
         KeyCode::Esc => {
-            app.screen = Screen::Menu;
-            app.status = "".to_string();
+            back_from_song_details(app);
         }
         KeyCode::Tab => {
             app.detail_focus = match app.detail_focus {
@@ -903,6 +931,8 @@ fn handle_detail_keys(
                 }
             }
         }
+        KeyCode::Char('a') | KeyCode::Char('A') => bulk_select_tracks(app, true),
+        KeyCode::Char('n') | KeyCode::Char('N') => bulk_select_tracks(app, false),
         KeyCode::Char('i') => {
             app.intro_click = !app.intro_click;
         }
@@ -956,18 +986,18 @@ fn handle_detail_keys(
                             vec![
                                 "This will open a visible Chromium browser.".to_string(),
                                 "Do not interact with the browser during downloading.".to_string(),
-                                "Continue?".to_string(),
+                                "Choose Download Process".to_string(),
                             ]
                         } else if resume_available {
                             vec![
                                 "This will use the original HTTP downloader.".to_string(),
                                 "A matching unfinished download can be resumed.".to_string(),
-                                "Continue?".to_string(),
+                                "Choose Download Process".to_string(),
                             ]
                         } else {
                             vec![
                                 "This will use the original HTTP downloader.".to_string(),
-                                "Continue?".to_string(),
+                                "Choose Download Process".to_string(),
                             ]
                         },
                         selected: 0,
@@ -989,6 +1019,67 @@ fn handle_detail_keys(
     Ok(false)
 }
 
+#[cfg(test)]
+mod c24_navigation_selection_tests {
+    use super::*;
+
+    fn test_app() -> App {
+        App::new(Arc::new(Mutex::new(LogBuffer::new(20))))
+    }
+
+    #[test]
+    fn select_all_and_none_only_change_tracks_in_track_pane() {
+        let mut app = test_app();
+        app.tracks = vec![
+            Track { name: "Drum Kit".into(), selected: true },
+            Track { name: "Bass".into(), selected: false },
+            Track { name: "Piano".into(), selected: true },
+        ];
+        app.detail_focus = DetailFocus::Tracks;
+        bulk_select_tracks(&mut app, false);
+        assert!(app.tracks.iter().all(|track| !track.selected));
+        bulk_select_tracks(&mut app, true);
+        assert!(app.tracks.iter().all(|track| track.selected));
+
+        app.detail_focus = DetailFocus::Download;
+        bulk_select_tracks(&mut app, false);
+        assert!(app.tracks.iter().all(|track| track.selected));
+    }
+
+    #[test]
+    fn sorting_retains_highlighted_song_through_each_sort_order() {
+        let mut app = test_app();
+        app.all_songs = vec![
+            Song { artist: "Zulu".into(), title: "Alpha".into(), url: "https://example.test/one".into(), first_seen: 3, purchase_date: 20260101 },
+            Song { artist: "Beta".into(), title: "Charlie".into(), url: "https://example.test/two".into(), first_seen: 2, purchase_date: 20260201 },
+            Song { artist: "Alpha".into(), title: "Bravo".into(), url: "https://example.test/three".into(), first_seen: 1, purchase_date: 20260301 },
+        ];
+        apply_song_view(&mut app);
+        let wanted = "https://example.test/one";
+        let first_index = app.songs.iter().position(|song| song.url == wanted).unwrap();
+        app.songs_state.select(Some(first_index));
+
+        for expected in [SongSort::Artist, SongSort::Title, SongSort::DateDescending] {
+            cycle_song_sort_preserving_selection(&mut app);
+            assert_eq!(app.song_sort, expected);
+            let selected = app.songs_state.selected().unwrap();
+            assert_eq!(app.songs[selected].url, wanted);
+        }
+    }
+
+    #[test]
+    fn detail_back_returns_to_existing_song_list() {
+        let mut app = test_app();
+        app.screen = Screen::SongDetail;
+        app.status = "Temporary message".into();
+        app.songs_state.select(Some(2));
+        back_from_song_details(&mut app);
+        assert_eq!(app.screen, Screen::Songs);
+        assert_eq!(app.songs_state.selected(), Some(2));
+        assert!(app.status.is_empty());
+    }
+}
+
 fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     match app.screen {
         Screen::Menu => render_menu(frame, app),
@@ -1008,6 +1099,28 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     }
 }
 
+/// Ordinary text is soft gray rather than terminal-default white.
+fn normal_text_style() -> Style {
+    Style::default().fg(Color::Gray)
+}
+
+/// Match the Main Menu's gold text selection; no light background fill.
+fn selected_text_style() -> Style {
+    Style::default().fg(Color::Yellow)
+}
+
+/// Unchecked stems are dimmer than checked stems; the keyboard cursor
+/// remains gold so its position is always visible, even on an unchecked row.
+fn track_name_style(is_highlighted: bool, selected: bool) -> Style {
+    if is_highlighted {
+        selected_text_style()
+    } else if selected {
+        normal_text_style()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
 fn render_menu(frame: &mut ratatui::Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1022,27 +1135,27 @@ fn render_menu(frame: &mut ratatui::Frame, app: &mut App) {
     let logo = vec![
         Line::from(Span::styled(
             r"██╗  ██╗██╗   ██╗      ██████╗  ██████╗ ██╗    ██╗███╗   ██╗██╗      ██████╗  █████╗ ██████╗ ███████╗██████╗ ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Cyan),
         )),
         Line::from(Span::styled(
             r"██║ ██╔╝██║   ██║      ██╔══██╗██╔═══██╗██║    ██║████╗  ██║██║     ██╔═══██╗██╔══██╗██╔══██╗██╔════╝██╔══██╗",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Cyan),
         )),
         Line::from(Span::styled(
             r"█████╔╝ ██║   ██║█████╗██║  ██║██║   ██║██║ █╗ ██║██╔██╗ ██║██║     ██║   ██║███████║██║  ██║█████╗  ██████╔╝",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Cyan),
         )),
         Line::from(Span::styled(
             r"██╔═██╗ ╚██╗ ██╔╝╚════╝██║  ██║██║   ██║██║███╗██║██║╚██╗██║██║     ██║   ██║██╔══██║██║  ██║██╔══╝  ██╔══██╗",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Cyan),
         )),
         Line::from(Span::styled(
             r"██║  ██╗ ╚████╔╝       ██████╔╝╚██████╔╝╚███╔███╔╝██║ ╚████║███████╗╚██████╔╝██║  ██║██████╔╝███████╗██║  ██║",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Cyan),
         )),
         Line::from(Span::styled(
             r"╚═╝  ╚═╝  ╚═══╝        ╚═════╝  ╚═════╝  ╚══╝╚══╝ ╚═╝  ╚═══╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Cyan),
         )),
     ];
     let logo = Paragraph::new(Text::from(logo))
@@ -1062,11 +1175,9 @@ fn render_menu(frame: &mut ratatui::Frame, app: &mut App) {
         .map(|(i, item)| {
             let prefix = if i == app.menu_index { ">" } else { " " };
             let style = if i == app.menu_index {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
+                selected_text_style()
             } else {
-                Style::default().fg(Color::Reset)
+                normal_text_style()
             };
             if item == "Set Download Folder" {
                 let current = abbreviate_path(&app.download_dir, 20);
@@ -1074,7 +1185,7 @@ fn render_menu(frame: &mut ratatui::Frame, app: &mut App) {
                     Span::styled(format!("{} {}", prefix, item), style),
                     Span::styled(
                         format!("  (current: {current})"),
-                        Style::default().fg(Color::DarkGray),
+                        normal_text_style(),
                     ),
                 ]))
             } else {
@@ -1093,7 +1204,7 @@ fn render_menu(frame: &mut ratatui::Frame, app: &mut App) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+        .highlight_style(Style::default());
 
     frame.render_widget(list, chunks[1]);
 
@@ -1104,17 +1215,78 @@ fn render_menu(frame: &mut ratatui::Frame, app: &mut App) {
                 .title("Status")
                 .border_style(Style::default().fg(Color::DarkGray)),
         )
+        .style(normal_text_style())
         .wrap(Wrap { trim: true });
     frame.render_widget(status, chunks[2]);
 
-    let help = Paragraph::new("Enter: select | ESC: back | Ctrl+C: quit")
+    frame.render_widget(footer_help("Enter: select | ESC: back | Ctrl+C: quit"), chunks[3]);
+}
+
+/// Render lower instruction bars with one consistent readable style.
+/// The leading two spaces separate instructions from the left border.
+fn footer_help(text: &str) -> Paragraph<'static> {
+    Paragraph::new(format!("  {text}"))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray)),
         )
-        .style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(help, chunks[3]);
+        .style(Style::default().fg(Color::Gray))
+        .alignment(Alignment::Left)
+}
+
+/// Fit one label to a terminal column without moving the next column.
+fn clip_song_column(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut clipped = value.chars().take(width - 1).collect::<String>();
+    clipped.push('…');
+    clipped
+}
+
+/// Artist is the first column only when sorting by artist.
+/// Dot leaders give every second column a consistent starting position.
+fn song_list_row(song: &Song, sort: SongSort, first_width: usize, total_width: usize) -> String {
+    let (first, second) = if sort == SongSort::Artist {
+        (&song.artist, &song.title)
+    } else {
+        (&song.title, &song.artist)
+    };
+    let first = clip_song_column(first, first_width.saturating_sub(3));
+    let leader = ".".repeat(first_width.saturating_sub(first.chars().count()));
+    let second = clip_song_column(second, total_width.saturating_sub(first_width));
+    format!("{first}{leader}{second}")
+}
+
+/// Blank items before each real song create whitespace without changing the
+/// logical song indices or allowing blank rows to receive the highlight.
+fn song_list_items(songs: &[Song], sort: SongSort, total_width: usize) -> Vec<ListItem<'static>> {
+    let longest_first = songs.iter()
+        .map(|song| if sort == SongSort::Artist { &song.artist } else { &song.title })
+        .map(|label| label.chars().count())
+        .max()
+        .unwrap_or(0);
+    // Leave at least 18 columns for the right-hand text in an ordinary terminal.
+    let first_width = longest_first.saturating_add(4)
+        .max(24)
+        .min(50)
+        .min(total_width.saturating_sub(18));
+    let mut items = Vec::with_capacity(songs.len() * 2);
+    for song in songs {
+        items.push(ListItem::new(Line::default()));
+        items.push(ListItem::new(Line::from(song_list_row(
+            song, sort, first_width, total_width,
+        ))));
+    }
+    items
+}
+
+fn song_display_index(index: usize) -> usize {
+    index.saturating_mul(2).saturating_add(1)
 }
 
 fn render_songs(frame: &mut ratatui::Frame, app: &mut App) {
@@ -1123,11 +1295,8 @@ fn render_songs(frame: &mut ratatui::Frame, app: &mut App) {
         .constraints([Constraint::Min(3), Constraint::Length(3)].as_ref())
         .split(frame.size());
 
-    let items: Vec<ListItem> = app
-        .songs
-        .iter()
-        .map(|song| ListItem::new(format!("{} - {}", song.title, song.artist)))
-        .collect();
+    let available_width = chunks[0].width.saturating_sub(2) as usize;
+    let items = song_list_items(&app.songs, app.song_sort, available_width);
 
     let base_title = match app.songs_mode {
         SongsMode::Browse => "My Songs",
@@ -1140,7 +1309,7 @@ fn render_songs(frame: &mut ratatui::Frame, app: &mut App) {
     };
     let editing = if app.editing_song_filter { " [typing]" } else { "" };
     let title = format!(
-        "{} | Sort: {}{}{}",
+        "{} | SORT [S]: {}{}{}",
         base_title,
         app.song_sort.label(),
         filter,
@@ -1153,26 +1322,21 @@ fn render_songs(frame: &mut ratatui::Frame, app: &mut App) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
+        .style(normal_text_style())
+        .highlight_style(selected_text_style());
 
-    frame.render_stateful_widget(list, chunks[0], &mut app.songs_state);
+    // The display list uses [blank, song, blank, song, ...]. Keep the
+    // persistent navigation state expressed as real song indices.
+    let display_selection = app.songs_state.selected().map(song_display_index);
+    app.songs_display_state.select(display_selection);
+    frame.render_stateful_widget(list, chunks[0], &mut app.songs_display_state);
 
     let help_text = match app.songs_mode {
-        SongsMode::Browse => "Enter: open | /: filter | s: sort | ESC: menu",
-        SongsMode::ResetProgress => "Enter: reset | /: filter | s: sort | ESC: menu",
+        SongsMode::Browse => "S: CHANGE SORT (Recent / Artist / Title) | Enter: open | Esc: back",
+        SongsMode::ResetProgress => "S: CHANGE SORT (Recent / Artist / Title) | Enter: reset | Esc: back",
     };
-    let help = Paragraph::new(help_text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        )
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(Alignment::Left);
-    frame.render_widget(help, chunks[1]);
+    frame.render_widget(footer_help(help_text), chunks[1]);
 }
-
 fn render_detail(frame: &mut ratatui::Frame, app: &mut App) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1193,10 +1357,10 @@ fn render_detail(frame: &mut ratatui::Frame, app: &mut App) {
     let key_display = format_key_display(app.base_key.as_deref(), app.key_shift);
     let controls = vec![
         Line::from(vec![
-            Span::styled("Intro Click: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("Intro Click: ", normal_text_style()),
             Span::raw(if app.intro_click { "On" } else { "Off" }),
             Span::raw("   "),
-            Span::styled("Key: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("Key: ", normal_text_style()),
             Span::raw(key_display),
             Span::raw("   Method: "),
             Span::raw(if app.use_browser { "Chromium" } else { "HTTP" }),
@@ -1205,13 +1369,14 @@ fn render_detail(frame: &mut ratatui::Frame, app: &mut App) {
         Line::from(vec![
             Span::styled(
                 "Download folder: ",
-                Style::default().add_modifier(Modifier::BOLD),
+                normal_text_style(),
             ),
             Span::raw(app.download_dir.display().to_string()),
         ]),
     ];
 
     let header = Paragraph::new(Text::from(controls))
+        .style(normal_text_style())
         .block(
             Block::default()
                 .title(title)
@@ -1224,17 +1389,18 @@ fn render_detail(frame: &mut ratatui::Frame, app: &mut App) {
     let items: Vec<ListItem> = app
         .tracks
         .iter()
-        .map(|track| {
-            let bracket_style = Style::default().fg(Color::DarkGray);
-            let mark_style = if track.selected {
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        .enumerate()
+        .map(|(index, track)| {
+            let is_highlighted = app.detail_focus == DetailFocus::Tracks
+                && app.tracks_state.selected() == Some(index);
+            let text_style = track_name_style(is_highlighted, track.selected);
+            let bracket_style = text_style;
+            let mark_style = if is_highlighted {
+                selected_text_style()
+            } else if track.selected {
+                Style::default().fg(Color::Green)
             } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let text_style = if track.selected {
-                Style::default().fg(Color::Reset)
-            } else {
-                Style::default().fg(Color::DarkGray)
+                track_name_style(false, false)
             };
             let line = Line::from(vec![
                 Span::styled("[", bracket_style),
@@ -1258,7 +1424,7 @@ fn render_detail(frame: &mut ratatui::Frame, app: &mut App) {
     );
 
     let track_block_title = if app.detail_focus == DetailFocus::Tracks {
-        format!("Tracks (space to toggle) | {track_count}")
+        format!("Tracks (Space: toggle, A: all, N: none) | {track_count}")
     } else {
         format!("Tracks | {track_count}")
     };
@@ -1274,8 +1440,9 @@ fn render_detail(frame: &mut ratatui::Frame, app: &mut App) {
                     Style::default().fg(Color::DarkGray)
                 }),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
+        // Selection color is applied explicitly to the selected row above,
+        // preserving it only when the Tracks pane has focus.
+        .style(normal_text_style());
 
     frame.render_stateful_widget(list, layout[1], &mut app.tracks_state);
 
@@ -1287,14 +1454,10 @@ fn render_detail(frame: &mut ratatui::Frame, app: &mut App) {
         &app.download_dir,
     );
 
-    let help = Paragraph::new("Tab: switch pane | Space: toggle | i: intro | +/-: key | ESC: menu")
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        )
-        .style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(help, layout[3]);
+    frame.render_widget(
+        footer_help("Space: toggle | A: all | N: none | Tab: panes | Esc: songs"),
+        layout[3],
+    );
 }
 
 fn render_download_status(frame: &mut ratatui::Frame, app: &mut App) {
@@ -1327,17 +1490,14 @@ fn render_download_status(frame: &mut ratatui::Frame, app: &mut App) {
                 let style = match track.status {
                     TrackStatus::Downloading => Style::default()
                         .fg(Color::Black)
-                        .bg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
+                        .bg(Color::Yellow),
                     TrackStatus::Done => Style::default()
                         .fg(Color::Black)
-                        .bg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
+                        .bg(Color::Green),
                     TrackStatus::Failed => Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Red)
-                        .add_modifier(Modifier::BOLD),
-                    TrackStatus::Pending => Style::default().fg(Color::DarkGray),
+                        .fg(Color::Gray)
+                        .bg(Color::Red),
+                    TrackStatus::Pending => normal_text_style(),
                 };
                 let attempt = match track.status {
                     TrackStatus::Downloading => format!(" (attempt {}/3)", track.attempt.max(1)),
@@ -1354,7 +1514,9 @@ fn render_download_status(frame: &mut ratatui::Frame, app: &mut App) {
         vec![ListItem::new("No download in progress.")]
     };
 
-    let track_list = List::new(track_items).block(
+    let track_list = List::new(track_items)
+        .style(normal_text_style())
+        .block(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
@@ -1390,14 +1552,10 @@ fn render_download_status(frame: &mut ratatui::Frame, app: &mut App) {
         .scroll((app.log_scroll, 0));
     frame.render_widget(log_block, columns[1]);
 
-    let footer = Paragraph::new("Up/Down: scroll logs | End: follow latest | ESC: menu (after finish)")
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        )
-        .style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(footer, chunks[1]);
+    frame.render_widget(
+        footer_help("Up/Down: scroll logs | End: follow latest | ESC: menu (after finish)"),
+        chunks[1],
+    );
 }
 
 /// Read only the C23 fingerprinted state for this exact HTTP request.
@@ -1534,8 +1692,7 @@ fn render_download_done(frame: &mut ratatui::Frame, app: &mut App) {
     lines.push(Line::from(Span::styled(
         heading,
         Style::default()
-            .fg(heading_color)
-            .add_modifier(Modifier::BOLD),
+            .fg(heading_color),
     )));
     if let Some(Err(error)) = download.done.as_ref() {
         lines.push(Line::from(Span::styled(
@@ -1616,6 +1773,7 @@ fn render_download_done(frame: &mut ratatui::Frame, app: &mut App) {
     }
 
     let details = Paragraph::new(Text::from(lines))
+        .style(normal_text_style())
         .block(
             Block::default()
                 .title("Summary")
@@ -1634,12 +1792,11 @@ fn render_download_done(frame: &mut ratatui::Frame, app: &mut App) {
             let style = if i == app.done_menu_index {
                 Style::default()
                     .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Reset)
+                Style::default().fg(Color::Gray)
             };
             ListItem::new(Line::from(Span::styled(
-                format!("{} {}", prefix, item),
+                format!("  {} {}", prefix, item),
                 style,
             )))
         })
@@ -1650,9 +1807,9 @@ fn render_download_done(frame: &mut ratatui::Frame, app: &mut App) {
             Block::default()
                 .title("Next")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(Color::DarkGray)),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+        .highlight_style(Style::default());
     frame.render_widget(menu, chunks[1]);
 }
 
@@ -1679,18 +1836,18 @@ fn render_download_block(
     let mut lines = vec![
         Line::from(Span::styled(
             "[ Download ]",
-            Style::default().add_modifier(if focused {
-                Modifier::BOLD
-            } else {
-                Modifier::empty()
-            }),
+            normal_text_style(),
         )),
         Line::from(format!("Save to: {}", download_dir.display())),
     ];
     if !status.trim().is_empty() {
-        lines.push(Line::from(Span::raw(status)));
+        lines.push(Line::from(Span::styled(
+            status,
+            normal_text_style(),
+        )));
     }
     let content = Paragraph::new(Text::from(lines))
+        .style(normal_text_style())
         .alignment(Alignment::Center)
         .block(block);
 
@@ -3002,12 +3159,12 @@ fn render_loading_overlay(frame: &mut ratatui::Frame, app: &App) {
     let text = vec![
         Line::from(Span::styled(
             "Please wait",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Yellow),
         )),
         Line::from(Span::raw("")),
         Line::from(Span::styled(
             format!("{} {}", spinner, loading.message),
-            Style::default().fg(Color::Reset),
+            normal_text_style(),
         )),
     ];
 
@@ -3101,7 +3258,7 @@ fn render_recovery_overlay(frame: &mut ratatui::Frame, app: &App) {
                 .bg(Color::Yellow)
                 .remove_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White).remove_modifier(Modifier::BOLD)
+            normal_text_style().remove_modifier(Modifier::BOLD)
         };
 
         lines.push(Line::from(Span::styled(text, style)));
@@ -3152,9 +3309,8 @@ fn render_recovery_cleanup_confirmation(
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            normal_text_style()
         };
 
         lines.push(Line::from(Span::styled(
@@ -3404,6 +3560,253 @@ mod c23_saved_selection_restore_tests {
     }
 }
 
+/// Render download choices as neutral text rows with one blank line between.
+/// Only the currently selected choice receives a high-contrast highlight.
+fn download_confirmation_choice_lines(
+    labels: &[&str],
+    selected: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (index, label) in labels.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::default());
+        }
+        let is_selected = index == selected;
+        let style = if is_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+        } else {
+            normal_text_style()
+        };
+        let pointer = if is_selected { ">" } else { " " };
+        lines.push(Line::from(Span::styled(
+            format!("  {pointer} {}  ", label.trim()),
+            style,
+        )));
+    }
+    lines
+}
+
+#[cfg(test)]
+mod c24_download_confirm_layout_tests {
+    use super::*;
+
+    #[test]
+    fn four_choices_are_vertical_with_only_selected_choice_highlighted() {
+        let labels = download_confirmation_labels(true);
+        let lines = download_confirmation_choice_lines(labels, 2);
+        assert_eq!(lines.len(), 7); // Four choices and three blank lines.
+        for (index, label) in labels.iter().enumerate() {
+            let row = &lines[index * 2];
+            assert_eq!(row.spans.len(), 1);
+            assert!(row.spans[0].content.contains(label.trim()));
+            assert_eq!(row.spans[0].style.bg, if index == 2 { Some(Color::Yellow) } else { None });
+            if index < 3 {
+                assert!(lines[index * 2 + 1].spans.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn three_choices_without_resume_are_vertical_and_preserve_cancel() {
+        let labels = download_confirmation_labels(false);
+        let lines = download_confirmation_choice_lines(labels, 0);
+        assert_eq!(lines.len(), 5);
+        assert_eq!(download_confirmation_cancel_index(false), 2);
+        assert!(lines[4].spans[0].content.contains("CANCEL"));
+        assert_eq!(lines[0].spans[0].style.bg, Some(Color::Yellow));
+        assert_eq!(lines[2].spans[0].style.bg, None);
+        assert_eq!(lines[4].spans[0].style.bg, None);
+    }
+
+    #[test]
+    fn arrow_keys_navigate_download_choices_vertically() -> Result<()> {
+        let mut app = App::new(Arc::new(Mutex::new(LogBuffer::new(20))));
+        app.confirm = Some(ConfirmState {
+            message: vec![],
+            selected: 0,
+            payload: ConfirmPayload::StartDownload {
+                song: Song {
+                    title: "Test".into(), artist: "Artist".into(),
+                    url: "https://example.test/song".into(),
+                    first_seen: 0, purchase_date: 0,
+                },
+                selected_tracks: vec!["Bass".into()],
+                use_browser: false,
+                intro_click: false,
+                key_shift: 0,
+                resume_available: true,
+            },
+        });
+        handle_confirm_keys(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))?;
+        assert_eq!(app.confirm.as_ref().unwrap().selected, 1);
+        handle_confirm_keys(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))?;
+        assert_eq!(app.confirm.as_ref().unwrap().selected, 0);
+        handle_confirm_keys(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))?;
+        assert_eq!(app.confirm.as_ref().unwrap().selected, 3); // Up from first choice wraps to Cancel.
+        handle_confirm_keys(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))?;
+        assert_eq!(app.confirm.as_ref().unwrap().selected, 0);
+        Ok(())
+    }
+}
+
+/// Download confirmation gets two lines below its heading, a blank line
+/// after the method description, and two lines before the vertical options.
+/// Other Yes/No dialogs preserve their existing spacing.
+fn confirmation_intro_lines(message: &[String], download_confirm: bool) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        "Please Confirm",
+        Style::default().fg(Color::Yellow),
+    ))];
+    lines.push(Line::default());
+    if download_confirm {
+        lines.push(Line::default());
+    }
+    for (index, text) in message.iter().enumerate() {
+        lines.push(Line::from(Span::raw(text.clone())));
+        if download_confirm && index == 0 {
+            lines.push(Line::default());
+        }
+    }
+    lines.push(Line::default());
+    if download_confirm {
+        lines.push(Line::default());
+    }
+    lines
+}
+
+fn vertically_centered_confirmation(lines: Vec<Line<'static>>, height: usize) -> Vec<Line<'static>> {
+    let top_padding = height.saturating_sub(lines.len()) / 2;
+    let mut centered = Vec::with_capacity(lines.len() + top_padding);
+    centered.extend(std::iter::repeat_with(Line::default).take(top_padding));
+    centered.extend(lines);
+    centered
+}
+
+#[cfg(test)]
+mod c24_soft_text_theme_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_text_is_gray_and_not_bold() {
+        let style = normal_text_style();
+        assert_eq!(style.fg, Some(Color::Gray));
+        assert_eq!(style.bg, None);
+        assert!(!style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn highlighted_song_and_track_use_gold_text_without_white_background() {
+        let style = selected_text_style();
+        assert_eq!(style.fg, Some(Color::Yellow));
+        assert_eq!(style.bg, None);
+        assert!(!style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn deselected_stems_are_dimmed_without_losing_gold_keyboard_focus() {
+        let checked = track_name_style(false, true);
+        let unchecked = track_name_style(false, false);
+        let active_unchecked = track_name_style(true, false);
+        assert_eq!(checked.fg, Some(Color::Gray));
+        assert_eq!(unchecked.fg, Some(Color::DarkGray));
+        assert_eq!(active_unchecked.fg, Some(Color::Yellow));
+        for style in [checked, unchecked, active_unchecked] {
+            assert_eq!(style.bg, None);
+            assert!(!style.add_modifier.contains(Modifier::BOLD));
+        }
+    }
+
+    #[test]
+    fn unselected_download_choice_is_gray_but_selected_choice_keeps_gold_fill() {
+        let rows = download_confirmation_choice_lines(&[" Keep Existing ", " Cancel "], 1);
+        assert_eq!(rows[0].spans[0].style.fg, Some(Color::Gray));
+        assert_eq!(rows[0].spans[0].style.bg, None);
+        assert_eq!(rows[2].spans[0].style.bg, Some(Color::Yellow));
+        assert!(!rows[2].spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+}
+
+#[cfg(test)]
+mod c24_visual_readability_tests {
+    use super::*;
+
+    fn song(title: &str, artist: &str) -> Song {
+        Song {
+            title: title.into(), artist: artist.into(),
+            url: format!("https://example.test/{title}"),
+            first_seen: 1, purchase_date: 20260101,
+        }
+    }
+
+    #[test]
+    fn song_columns_align_and_swap_for_artist_sort() {
+        let photograph = song("Photograph", "Def Leppard");
+        let dirty = song("Dirty Laundry", "Don Henley");
+        let title_rows = [
+            song_list_row(&photograph, SongSort::Title, 25, 64),
+            song_list_row(&dirty, SongSort::Title, 25, 64),
+        ];
+        assert_eq!(title_rows[0].find("Def Leppard"), Some(25));
+        assert_eq!(title_rows[1].find("Don Henley"), Some(25));
+        assert!(title_rows.iter().all(|row| row.contains('.')));
+
+        let artist_row = song_list_row(&photograph, SongSort::Artist, 25, 64);
+        assert!(artist_row.starts_with("Def Leppard"));
+        assert_eq!(artist_row.find("Photograph"), Some(25));
+        assert!(song_list_row(&photograph, SongSort::DateDescending, 25, 64)
+            .starts_with("Photograph"));
+    }
+
+    #[test]
+    fn blank_rows_are_not_songs_or_selectable() {
+        let items = song_list_items(&[
+            song("Photograph", "Def Leppard"),
+            song("Dirty Laundry", "Don Henley"),
+        ], SongSort::Title, 80);
+        assert_eq!(items.len(), 4);
+        // Each real song occupies the row immediately after an empty item.
+        assert_eq!(song_display_index(0), 1);
+        assert_eq!(song_display_index(1), 3);
+    }
+
+    #[test]
+    fn narrow_song_columns_truncate_without_pushing_artist_out() {
+        let row = song_list_row(
+            &song("A Very Long Song Name", "A Very Long Artist Name"),
+            SongSort::Title, 12, 30,
+        );
+        assert!(row.chars().count() <= 30);
+        assert!(row.contains('…'));
+    }
+
+    #[test]
+    fn download_confirmation_has_requested_blank_lines() {
+        let lines = confirmation_intro_lines(&[
+            "This will use the original HTTP downloader.".into(),
+            "Choose Download Process".into(),
+        ], true);
+        assert_eq!(lines.len(), 8);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "Please Confirm");
+        assert!(lines[1].spans.is_empty() && lines[2].spans.is_empty());
+        assert!(lines[4].spans.is_empty());
+        assert_eq!(lines[5].spans[0].content.as_ref(), "Choose Download Process");
+        assert!(lines[6].spans.is_empty() && lines[7].spans.is_empty());
+        let centered = vertically_centered_confirmation(lines, 14);
+        assert_eq!(centered.len(), 11); // three lines of top padding.
+        assert!(centered[..3].iter().all(|line| line.spans.is_empty()));
+    }
+
+    #[test]
+    fn other_confirmation_dialog_spacing_remains_compact() {
+        let lines = confirmation_intro_lines(&["Restore selection?".into()], false);
+        assert_eq!(lines.len(), 4);
+        assert!(lines[1].spans.is_empty());
+        assert_eq!(lines[2].spans[0].content.as_ref(), "Restore selection?");
+    }
+}
+
 fn render_confirm_overlay(frame: &mut ratatui::Frame, app: &App) {
     let Some(confirm) = &app.confirm else {
         return;
@@ -3412,58 +3815,49 @@ fn render_confirm_overlay(frame: &mut ratatui::Frame, app: &App) {
         ConfirmPayload::StartDownload { resume_available, .. } => *resume_available,
         _ => false,
     };
-    let area = centered_rect(if resume_available { 90 } else { 70 }, 35, frame.size());
-    frame.render_widget(Clear, area);
-
-    let mut lines = vec![Line::from(Span::styled(
-        "Please confirm",
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-    ))];
-    lines.push(Line::from(""));
-    for line in &confirm.message {
-        lines.push(Line::from(Span::raw(line)));
-    }
-
-    lines.push(Line::from(""));
     let download_confirm =
         matches!(&confirm.payload, ConfirmPayload::StartDownload { .. });
+    // A vertical list needs more space than the old horizontal row.
+    let height = if download_confirm { 80 } else { 35 };
+    let area = centered_rect(if resume_available { 90 } else { 70 }, height, frame.size());
+    frame.render_widget(Clear, area);
 
+    let mut lines = confirmation_intro_lines(&confirm.message, download_confirm);
     let labels: &[&str] = if download_confirm {
         download_confirmation_labels(resume_available)
     } else {
         &[" YES ", " NO "]
     };
 
-    let mut choices = Vec::new();
-
-    for (index, label) in labels.iter().enumerate() {
-        let color = match (download_confirm, index) {
-            (true, 0) => Color::Green,
-            (true, 1) => Color::Yellow,
-            (true, 2) if resume_available => Color::Cyan,
-            (_, 0) => Color::Green,
-            _ => Color::Red,
-        };
-
-        let style = if confirm.selected == index {
-            Style::default()
-                .fg(Color::Black)
-                .bg(color)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(color)
-        };
-
-        choices.push(Span::styled((*label).to_string(), style));
-
-        if index + 1 < labels.len() {
-            choices.push(Span::raw(" "));
+    if download_confirm {
+        lines.extend(download_confirmation_choice_lines(labels, confirm.selected));
+    } else {
+        // Preserve the existing two-choice Yes/No dialogs without redesigning them.
+        let mut choices = Vec::new();
+        for (index, label) in labels.iter().enumerate() {
+            let color = if index == 0 { Color::Green } else { Color::Red };
+            let style = if confirm.selected == index {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(color)
+            } else {
+                Style::default().fg(color)
+            };
+            choices.push(Span::styled((*label).to_string(), style));
+            if index + 1 < labels.len() {
+                choices.push(Span::raw(" "));
+            }
         }
+        lines.push(Line::from(choices));
     }
 
-    lines.push(Line::from(choices));
-
+    // Keep the entire download-confirmation content centered vertically
+    // within its already-centered overlay. Other dialogs retain their layout.
+    if download_confirm {
+        lines = vertically_centered_confirmation(lines, area.height.saturating_sub(2) as usize);
+    }
     let panel = Paragraph::new(Text::from(lines))
+        .style(normal_text_style())
         .block(
             Block::default()
                 .title("Confirm")
@@ -3623,7 +4017,7 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
         return Ok(false);
     };
     match key.code {
-        KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+        KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::Up | KeyCode::Down => {
             let count = match &confirm.payload {
                 ConfirmPayload::StartDownload { resume_available, .. } => {
                     download_confirmation_labels(*resume_available).len()
@@ -3632,7 +4026,7 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
             };
 
             confirm.selected = match key.code {
-                KeyCode::Left => (confirm.selected + count - 1) % count,
+                KeyCode::Left | KeyCode::Up => (confirm.selected + count - 1) % count,
                 _ => (confirm.selected + 1) % count,
             };
         }
