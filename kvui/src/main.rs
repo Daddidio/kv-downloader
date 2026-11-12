@@ -56,12 +56,6 @@ enum Screen {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SongsMode {
-    Browse,
-    ResetProgress,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SongSort {
     DateDescending,
     Artist,
@@ -101,7 +95,6 @@ struct App {
     songs_state: ListState,
     // Visual rows include blank separators, while songs_state retains real song indices.
     songs_display_state: ListState,
-    songs_mode: SongsMode,
     song_sort: SongSort,
     song_filter: String,
     editing_song_filter: bool,
@@ -143,14 +136,13 @@ impl App {
             all_songs: Vec::new(),
             songs_state: ListState::default(),
             songs_display_state: ListState::default(),
-            songs_mode: SongsMode::Browse,
             song_sort: SongSort::DateDescending,
             song_filter: String::new(),
             editing_song_filter: false,
             tracks: Vec::new(),
             tracks_state: ListState::default(),
             detail_focus: DetailFocus::Tracks,
-            intro_click: true,
+            intro_click: false,
             use_browser: false,
             key_shift: 0,
             base_key: None,
@@ -191,8 +183,7 @@ impl App {
             return;
         }
 
-        // The C23 resume checkpoint is independent of temporary staging data.
-        // Clean abandoned folders before counting incomplete downloads.
+        // Clean abandoned staging folders before checking incomplete downloads.
         if let Err(err) = cleanup_abandoned_staging(&self.download_dir) {
             tracing::warn!("Pre-scan staging cleanup failed: {}", err);
         }
@@ -238,8 +229,6 @@ impl App {
             vec![
                 "Browse My Songs".to_string(),
                 "Resync Songs List".to_string(),
-                "Reset Song Progress".to_string(),
-                "Reset All Download Progress".to_string(),
                 "Set Download Folder".to_string(),
                 "Logout".to_string(),
                 "Quit".to_string(),
@@ -248,8 +237,6 @@ impl App {
             vec![
                 "Browse My Songs".to_string(),
                 "Resync Songs List".to_string(),
-                "Reset Song Progress".to_string(),
-                "Reset All Download Progress".to_string(),
                 "Set Download Folder".to_string(),
                 "Login".to_string(),
                 "Quit".to_string(),
@@ -333,8 +320,6 @@ fn configure_demo_screen(app: &mut App, screen: DemoScreen) {
     app.menu_items = vec![
         "Browse My Songs".to_string(),
         "Resync Songs List".to_string(),
-        "Reset Song Progress".to_string(),
-        "Reset All Download Progress".to_string(),
         "Set Download Folder".to_string(),
         "Logout".to_string(),
         "Quit".to_string(),
@@ -360,7 +345,7 @@ fn configure_demo_screen(app: &mut App, screen: DemoScreen) {
                 .collect();
             app.tracks_state.select(Some(1));
             app.base_key = Some("E".to_string());
-            app.intro_click = true;
+            app.intro_click = false;
             app.detail_focus = DetailFocus::Tracks;
             app.screen = Screen::SongDetail;
         }
@@ -389,7 +374,7 @@ fn configure_demo_screen(app: &mut App, screen: DemoScreen) {
             let complete = matches!(screen, DemoScreen::Complete);
             app.download = Some(DownloadState {
                 song,
-                count_in: true,
+                count_in: false,
                 transpose: 0,
                 tracks,
                 handle: None,
@@ -402,9 +387,6 @@ fn configure_demo_screen(app: &mut App, screen: DemoScreen) {
                 download_dir: dirs::home_dir()
                     .unwrap_or_else(|| PathBuf::from("~"))
                     .join("Downloads"),
-                c23_previously_verified: None,
-                c23_final_verified: None,
-                c23_report_issue: None,
             });
             if complete {
                 if let Some(download) = app.download.as_mut() {
@@ -626,16 +608,14 @@ fn handle_menu_keys(
                     keystore::Keystore::logout()?;
                     keystore::Keystore::clear_auth_cookie()?;
                     catalog::SongCatalog::open()?.clear()?;
-                    kv_core::download_progress::DownloadProgress::new().clear()?;
                     app.songs.clear();
                     app.all_songs.clear();
                     app.song_filter.clear();
-                    app.status = "Logged out; local catalog and download progress cleared".to_string();
+                    app.status = "Logged out; local catalog cleared".to_string();
                     app.refresh_menu();
                 }
                 "Browse My Songs" => {
                     app.status = "".to_string();
-                    app.songs_mode = SongsMode::Browse;
                     let cached = catalog::SongCatalog::open()?.list()?;
                     if cached.is_empty() {
                         match cookie_value() {
@@ -651,29 +631,9 @@ fn handle_menu_keys(
                 }
                 "Resync Songs List" => {
                     app.status = "".to_string();
-                    app.songs_mode = SongsMode::Browse;
                     match cookie_value() {
                         Ok(cookie) => start_loading_songs(app, cookie, true),
                         Err(err) => app.status = format!("Not authenticated: {}", err),
-                    }
-                }
-                "Reset Song Progress" => {
-                    app.status = "".to_string();
-                    app.songs_mode = SongsMode::ResetProgress;
-                    let progress = kv_core::download_progress::DownloadProgress::new();
-                    let tracked = progress
-                        .tracked_song_urls()?
-                        .into_iter()
-                        .collect::<std::collections::HashSet<_>>();
-                    let songs = catalog::SongCatalog::open()?
-                        .list()?
-                        .into_iter()
-                        .filter(|song| tracked.contains(&song.url))
-                        .collect::<Vec<_>>();
-                    if songs.is_empty() {
-                        app.status = "No saved song progress to reset".to_string();
-                    } else {
-                        set_song_list(app, songs);
                     }
                 }
                 "Set Download Folder" => {
@@ -701,16 +661,6 @@ fn handle_menu_keys(
                         }
                         Err(err) => app.status = format!("Invalid download folder: {err}"),
                     }
-                }
-                "Reset All Download Progress" => {
-                    app.confirm = Some(ConfirmState {
-                        message: vec![
-                            "Delete the entire download progress file?".to_string(),
-                            "All completed-track history in this file will be lost.".to_string(),
-                        ],
-                        selected: 1,
-                        payload: ConfirmPayload::ResetAllProgress,
-                    });
                 }
                 "Quit" => return Ok(true),
                 _ => {}
@@ -836,25 +786,9 @@ fn handle_songs_keys(
             if let Some(idx) = app.songs_state.selected() {
                 if let Some(song) = app.songs.get(idx).cloned() {
                     app.status = "".to_string();
-                    match app.songs_mode {
-                        SongsMode::Browse => match cookie_value() {
-                            Ok(cookie) => start_loading_tracks(app, cookie, song),
-                            Err(err) => app.status = format!("Not authenticated: {}", err),
-                        },
-                        SongsMode::ResetProgress => {
-                            app.confirm = Some(ConfirmState {
-                                message: vec![
-                                    format!("Reset all saved progress for '{}' by {}?", song.title, song.artist),
-                                    "All count-in and transpose variants for this song will be removed."
-                                        .to_string(),
-                                ],
-                                selected: 1,
-                                payload: ConfirmPayload::ResetSong {
-                                    url: song.url,
-                                    title: song.title,
-                                },
-                            });
-                        }
+                    match cookie_value() {
+                        Ok(cookie) => start_loading_tracks(app, cookie, song),
+                        Err(err) => app.status = format!("Not authenticated: {}", err),
                     }
                 }
             }
@@ -964,24 +898,18 @@ fn handle_detail_keys(
                         app.status = "Select at least one track to download".to_string();
                         return Ok(false);
                     }
-                    // Stateless downloads never consult historical Resume jobs.
-                    let resume_available = false;
                     app.confirm = Some(ConfirmState {
                         message: if app.use_browser {
                             vec![
                                 "This will open a visible Chromium browser.".to_string(),
                                 "Do not interact with the browser during downloading.".to_string(),
-                                "Choose Download Process".to_string(),
-                            ]
-                        } else if resume_available {
-                            vec![
-                                "This will use the original HTTP downloader.".to_string(),
-                                "A matching unfinished download can be resumed.".to_string(),
+                                "Selected stems will safely replace existing files.".to_string(),
                                 "Choose Download Process".to_string(),
                             ]
                         } else {
                             vec![
-                                "This will use the original HTTP downloader.".to_string(),
+                                "This will use the verified HTTP downloader.".to_string(),
+                                "Selected stems will safely replace existing files.".to_string(),
                                 "Choose Download Process".to_string(),
                             ]
                         },
@@ -992,7 +920,6 @@ fn handle_detail_keys(
                             use_browser: app.use_browser,
                             intro_click: app.intro_click,
                             key_shift: app.key_shift,
-                            resume_available,
                         },
                     });
                 }
@@ -1295,10 +1222,7 @@ fn render_songs(frame: &mut ratatui::Frame, app: &mut App) {
     let available_width = chunks[0].width.saturating_sub(2) as usize;
     let items = song_list_items(&app.songs, app.song_sort, available_width);
 
-    let base_title = match app.songs_mode {
-        SongsMode::Browse => "My Songs",
-        SongsMode::ResetProgress => "Choose Song to Reset Progress",
-    };
+    let base_title = "My Songs";
     let filter = if app.song_filter.is_empty() {
         String::new()
     } else {
@@ -1328,10 +1252,7 @@ fn render_songs(frame: &mut ratatui::Frame, app: &mut App) {
     app.songs_display_state.select(display_selection);
     frame.render_stateful_widget(list, chunks[0], &mut app.songs_display_state);
 
-    let help_text = match app.songs_mode {
-        SongsMode::Browse => "S: CHANGE SORT (Recent / Artist / Title) | Enter: open | Esc: back",
-        SongsMode::ResetProgress => "S: CHANGE SORT (Recent / Artist / Title) | Enter: reset | Esc: back",
-    };
+    let help_text = "S: CHANGE SORT (Recent / Artist / Title) | Enter: open | Esc: back";
     frame.render_widget(footer_help(help_text), chunks[1]);
 }
 fn render_detail(frame: &mut ratatui::Frame, app: &mut App) {
@@ -1555,120 +1476,11 @@ fn render_download_status(frame: &mut ratatui::Frame, app: &mut App) {
     );
 }
 
-/// Read only the C23 fingerprinted state for this exact HTTP request.
-/// Never infer verification from logs, filenames, or HTTP response codes.
-fn c23_verified_from_store(
-    store: &kv_core::c23_resume::ResumeStore,
-    song_url: &str,
-    destination: &Path,
-    count_in: bool,
-    transpose: i8,
-    selected_tracks: &[String],
-) -> Result<Option<std::collections::HashSet<String>>> {
-    let matching = store.jobs.iter().filter(|job| {
-        job.song_url == song_url
-            && job.destination == destination
-            && job.count_in == count_in
-            && job.transpose == transpose
-            && job.selected_tracks.len() == selected_tracks.len()
-            && selected_tracks.iter().all(|name| {
-                job.selected_tracks.iter().any(|saved| saved.eq_ignore_ascii_case(name))
-            })
-    }).collect::<Vec<_>>();
-
-    if matching.len() > 1 {
-        return Err(anyhow!("Multiple C23 records match the same download"));
-    }
-    let Some(job) = matching.first() else {
-        return Ok(None);
-    };
-    let pending = job.pending_tracks()?
-        .into_iter()
-        .map(|name| name.to_lowercase())
-        .collect::<std::collections::HashSet<_>>();
-    Ok(Some(selected_tracks.iter()
-        .map(|name| name.to_lowercase())
-        .filter(|name| !pending.contains(name))
-        .collect()))
-}
-
-fn c23_verified_snapshot(
-    song_url: &str,
-    destination: &Path,
-    count_in: bool,
-    transpose: i8,
-    selected_tracks: &[String],
-) -> Result<Option<std::collections::HashSet<String>>> {
-    use kv_core::c23_resume::ResumeStore;
-    let store = ResumeStore::load(&ResumeStore::default_path()?)?;
-    c23_verified_from_store(&store, song_url, destination, count_in, transpose, selected_tracks)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct C23CompletionCounts {
-    previously_verified: usize,
-    newly_verified: usize,
-    failed: usize,
-    pending: usize,
-}
-
-fn c23_completion_counts(download: &DownloadState) -> Option<C23CompletionCounts> {
-    let previous = download.c23_previously_verified.as_ref()?;
-    let final_verified = download.c23_final_verified.as_ref()?;
-    let mut counts = C23CompletionCounts {
-        previously_verified: 0, newly_verified: 0, failed: 0, pending: 0,
-    };
-    for track in &download.tracks {
-        let key = track.name.to_lowercase();
-        if final_verified.contains(&key) {
-            if previous.contains(&key) {
-                counts.previously_verified += 1;
-            } else {
-                counts.newly_verified += 1;
-            }
-        } else if track.status == TrackStatus::Failed {
-            counts.failed += 1;
-        } else {
-            counts.pending += 1;
-        }
-    }
-    Some(counts)
-}
-
-/// After the worker exits, reconcile its display against the verified C23
-/// journal. Does not change download/publishing behavior or any saved files.
-fn c23_finish_completion_report(download: &mut DownloadState) {
-    if download.c23_previously_verified.is_none() {
-        return; // Chromium uses its existing status behavior.
-    }
-    let selected = download.tracks.iter()
-        .map(|track| track.name.clone())
-        .collect::<Vec<_>>();
-    match c23_verified_snapshot(
-        &download.song.url, &download.download_dir,
-        download.count_in, download.transpose, &selected,
-    ) {
-        Ok(Some(verified)) => {
-            for track in &mut download.tracks {
-                if verified.contains(&track.name.to_lowercase()) {
-                    track.status = TrackStatus::Done;
-                } else if track.status == TrackStatus::Done {
-                    track.status = TrackStatus::Pending;
-                }
-            }
-            download.c23_final_verified = Some(verified);
-        }
-        Ok(None) => {
-            download.c23_report_issue = Some(
-                "No matching C23 verification record; completion totals unavailable".to_string()
-            );
-        }
-        Err(err) => {
-            download.c23_report_issue = Some(format!(
-                "Could not verify completion totals: {err}"
-            ));
-        }
-    }
+fn count_current_download_results(tracks: &[TrackStatusItem]) -> (usize, usize, usize) {
+    let completed = tracks.iter().filter(|track| track.status == TrackStatus::Done).count();
+    let failed = tracks.iter().filter(|track| track.status == TrackStatus::Failed).count();
+    let pending = tracks.len() - completed - failed;
+    (completed, failed, pending)
 }
 
 fn render_download_done(frame: &mut ratatui::Frame, app: &mut App) {
@@ -1713,63 +1525,18 @@ fn render_download_done(frame: &mut ratatui::Frame, app: &mut App) {
         download.download_dir.display()
     )));
     lines.push(Line::from(""));
-    if download.c23_previously_verified.is_some() {
-        if let Some(counts) = c23_completion_counts(download) {
-            lines.push(Line::from(format!(
-                "Verified: {} of {} | Failed: {} | Pending: {}",
-                counts.previously_verified + counts.newly_verified,
-                download.tracks.len(), counts.failed, counts.pending
-            )));
-            lines.push(Line::from(format!(
-                "Previously verified: {} | Newly downloaded: {}",
-                counts.previously_verified, counts.newly_verified
-            )));
-            lines.push(Line::from(""));
-            let previous = download.c23_previously_verified.as_ref().unwrap();
-            let verified = download.c23_final_verified.as_ref().unwrap();
-            for track in &download.tracks {
-                let key = track.name.to_lowercase();
-                let label = if verified.contains(&key) {
-                    if previous.contains(&key) { "previously verified" } else { "downloaded" }
-                } else if track.status == TrackStatus::Failed {
-                    "failed"
-                } else {
-                    "pending"
-                };
-                let marker = if verified.contains(&key) {
-                    "✓"
-                } else if track.status == TrackStatus::Failed {
-                    "✗"
-                } else {
-                    "-"
-                };
-                lines.push(Line::from(format!("  {} {} ({})", marker, track.name, label)));
-            }
-        } else {
-            lines.push(Line::from(Span::styled(
-                download.c23_report_issue.as_deref()
-                    .unwrap_or("C23 verification summary unavailable"),
-                Style::default().fg(Color::Yellow),
-            )));
-        }
-    } else {
-        // Preserve the existing Chromium summary; it has no C23 journal.
-        let completed = download.tracks.iter()
-            .filter(|track| track.status == TrackStatus::Done).count();
-        let failed = download.tracks.iter()
-            .filter(|track| track.status == TrackStatus::Failed).count();
-        let pending = download.tracks.len() - completed - failed;
-        lines.push(Line::from(format!(
-            "Tracks: {} completed, {} failed, {} pending", completed, failed, pending
-        )));
-        for track in &download.tracks {
-            let marker = match track.status {
-                TrackStatus::Done => "✓",
-                TrackStatus::Failed => "✗",
-                _ => "-",
-            };
-            lines.push(Line::from(format!("  {} {}", marker, track.name)));
-        }
+    // Counts describe the current operation only, never historical records.
+    let (completed, failed, pending) = count_current_download_results(&download.tracks);
+    lines.push(Line::from(format!(
+        "Tracks: {} completed, {} failed, {} pending", completed, failed, pending
+    )));
+    for track in &download.tracks {
+        let marker = match track.status {
+            TrackStatus::Done => "✓",
+            TrackStatus::Failed => "✗",
+            _ => "-",
+        };
+        lines.push(Line::from(format!("  {} {}", marker, track.name)));
     }
 
     let details = Paragraph::new(Text::from(lines))
@@ -2009,161 +1776,6 @@ fn prepare_staged_download(
         }
     }
 }
-/// Check whether the exact selected song, key, options and destination
-/// have a saved unfinished HTTP job with missing or unverified stems.
-fn c23_resume_is_available(
-    song: &Song,
-    selected_tracks: &[String],
-    download_root: &Path,
-    count_in: bool,
-    transpose: i8,
-) -> Result<bool> {
-    use kv_core::c23_resume::{ResumeJob, ResumeStore};
-
-    let destination = kvui_select_keyed_song_destination(
-        download_root,
-        &song.artist,
-        &song.title,
-        &song.url,
-        transpose,
-    )?;
-    let request = ResumeJob::new(
-        &song.url,
-        &destination,
-        count_in,
-        transpose,
-        selected_tracks.to_vec(),
-    )?;
-    let store = ResumeStore::load(&ResumeStore::default_path()?)?;
-    Ok(store.find_unfinished_match(&request)?.is_some())
-}
-
-/// Find unfinished HTTP jobs for this song without requiring the user to
-/// remember the previously selected stems or key. Never guess a destination.
-fn c23_restorable_jobs(
-    song: &Song,
-    available_tracks: &[Track],
-    download_root: &Path,
-    store: &kv_core::c23_resume::ResumeStore,
-) -> Result<Vec<kv_core::c23_resume::ResumeJob>> {
-    let mut matches = Vec::new();
-    for saved in &store.jobs {
-        if saved.song_url != song.url
-            || !(-4..=4).contains(&saved.transpose)
-            || saved.selected_tracks.is_empty()
-            || saved.selected_tracks.iter().any(|selected| {
-                !available_tracks.iter().any(|track| track.name.eq_ignore_ascii_case(selected))
-            })
-        {
-            continue;
-        }
-
-        // Verify the currently selected root and song's safe keyed destination.
-        let expected = match kvui_select_keyed_song_destination(
-            download_root,
-            &song.artist,
-            &song.title,
-            &song.url,
-            saved.transpose,
-        ) {
-            Ok(destination) => destination,
-            Err(err) => {
-                tracing::warn!("Saved resume destination cannot be checked: {err}");
-                continue;
-            }
-        };
-        if saved.destination != expected {
-            continue;
-        }
-
-        // An already-completed job is not an unfinished download.
-        if !saved.pending_tracks()?.is_empty() {
-            matches.push(saved.clone());
-        }
-    }
-    Ok(matches)
-}
-
-/// Offer to restore settings; never automatically begin downloading.
-fn c23_offer_saved_selection(app: &mut App, song: &Song) {
-    use kv_core::c23_resume::ResumeStore;
-
-    let matches = (|| -> Result<_> {
-        let store = ResumeStore::load(&ResumeStore::default_path()?)?;
-        c23_restorable_jobs(song, &app.tracks, &app.download_dir, &store)
-    })();
-
-    match matches {
-        Ok(mut jobs) if jobs.len() == 1 => {
-            let job = jobs.pop().unwrap();
-            match job.pending_tracks() {
-                Ok(pending) => {
-                    app.confirm = Some(ConfirmState {
-                        message: vec![
-                            format!("Unfinished download: {} stems, {} remaining.", job.selected_tracks.len(), pending.len()),
-                            format!("Restore selected stems, key {:+}, intro click {}?", job.transpose, if job.count_in { "On" } else { "Off" }),
-                            "Restoring settings will not start a download.".to_string(),
-                        ],
-                        selected: 1, // No is the safe default.
-                        payload: ConfirmPayload::RestoreSavedSelection { job },
-                    });
-                }
-                Err(err) => app.status = format!("Cannot inspect saved download: {err}"),
-            }
-        }
-        Ok(jobs) if jobs.len() > 1 => {
-            app.status = format!(
-                "{} unfinished versions of this song exist; no selection was changed.",
-                jobs.len()
-            );
-        }
-        Ok(_) => {}
-        Err(err) => {
-            tracing::warn!("Could not inspect saved downloads: {err}");
-            app.status = format!("Could not inspect saved downloads: {err}");
-        }
-    }
-}
-
-fn c23_apply_saved_selection(
-    app: &mut App,
-    job: &kv_core::c23_resume::ResumeJob,
-) -> Result<()> {
-    let song = app.current_song.as_ref().ok_or_else(|| anyhow!("No song selected"))?;
-    if song.url != job.song_url {
-        return Err(anyhow!("Saved download belongs to a different song"));
-    }
-    let expected = kvui_select_keyed_song_destination(
-        &app.download_dir, &song.artist, &song.title, &song.url, job.transpose,
-    )?;
-    if expected != job.destination || job.pending_tracks()?.is_empty() {
-        return Err(anyhow!("Saved download is no longer resumable in this destination"));
-    }
-
-    let selected = job.selected_tracks.iter()
-        .map(|name| name.to_lowercase())
-        .collect::<std::collections::HashSet<_>>();
-    if selected.len() != job.selected_tracks.len()
-        || selected.iter().any(|name| {
-            !app.tracks.iter().any(|track| track.name.eq_ignore_ascii_case(name))
-        })
-    {
-        return Err(anyhow!("Saved stems no longer match this song's available tracks"));
-    }
-
-    for track in &mut app.tracks {
-        track.selected = selected.contains(&track.name.to_lowercase());
-    }
-    app.intro_click = job.count_in;
-    app.key_shift = job.transpose;
-    app.use_browser = false; // C23 Resume is HTTP-only.
-    app.status = format!(
-        "Restored {} stems and download settings. Select Download, then Resume.",
-        job.selected_tracks.len()
-    );
-    Ok(())
-}
-
 /// Phase 2C: download every selected HTTP stem without consulting either
 /// historical progress tracker or C23 Resume. Each accepted stem is checked
 /// against the requested name and key before independent safe publication.
@@ -2224,108 +1836,6 @@ fn run_stateless_http_download(
             return Err(err.into());
         }
     }
-    result
-}
-
-/// C23: Publish accepted HTTP stems as each download completes.
-/// Preserve completed files even when a later track fails.
-fn run_c23_http_download(
-    song_url: &str,
-    count_in: bool,
-    transpose: i8,
-    selected_tracks: Vec<String>,
-    resume: bool,
-    download_root: &Path,
-    song_destination: &Path,
-    policy: tasks::download_song::ExistingFilePolicy,
-) -> Result<()> {
-    use kv_core::c23_resume::{
-        checkpoint_http_completed_stem, ResumeJob, ResumeStore,
-    };
-
-    let domain = extract_domain_from_url(song_url)
-        .ok_or_else(|| anyhow!("Missing domain from URL"))?;
-
-    cleanup_abandoned_staging(download_root)?;
-    let staging =
-        tasks::download_song::create_download_staging_dir(download_root)?;
-    let lock = tasks::download_song::lock_new_kvui_staging_directory(&staging)?;
-
-    let result = (|| -> Result<()> {
-        let request = ResumeJob::new(
-            song_url,
-            song_destination,
-            count_in,
-            transpose,
-            selected_tracks.clone(),
-        )?;
-
-        let state_path = ResumeStore::default_path()?;
-        let mut store = ResumeStore::load(&state_path)?;
-
-        // Plan before upsert so saved verified stems survive Resume.
-        let (mut job, tracks_to_download) = store.plan_download(request, resume)?;
-
-        // Record the job before attempting its first track.
-        store.upsert(job.clone());
-        store.save(&state_path)?;
-
-        // The legacy tracker must not skip tracks based on stale records.
-        kv_core::download_progress::DownloadProgress::new()
-            .start_fresh_download(song_url, count_in, transpose)?;
-
-        let options = tasks::download_song::DownloadOptions {
-            count_in,
-            transpose,
-            selected_tracks: Some(tracks_to_download),
-            force_restart: false,
-        };
-
-        tasks::download_song::download_song_http_with_hook(
-            song_url,
-            options,
-            Some(staging.to_string_lossy().into_owned()),
-            &domain,
-            &mut |track, file| {
-                checkpoint_http_completed_stem(
-                    file,
-                    &mut job,
-                    &mut store,
-                    &state_path,
-                    track,
-                    policy,
-                )
-            },
-        )?;
-
-        // Do not report success if selected stems remain unverified.
-        let pending = job.pending_tracks()?;
-        if !pending.is_empty() {
-            return Err(anyhow!(
-                "Download has {} unverified track(s): {}",
-                pending.len(),
-                pending.join(", ")
-            ));
-        }
-
-        Ok(())
-    })();
-
-    // C23 resume uses permanently saved files, not old staging data.
-    drop(lock);
-
-    if let Err(err) = fs::remove_dir_all(&staging) {
-        tracing::warn!(
-            "Could not remove temporary staging {}: {}",
-            staging.display(),
-            err
-        );
-
-        if result.is_ok() {
-            return Err(err.into());
-        }
-    }
-
     result
 }
 
@@ -2760,7 +2270,6 @@ fn update_download_state(app: &mut App) {
                     app.screen = Screen::DownloadDone;
                 }
             }
-            c23_finish_completion_report(download);
         }
     }
 }
@@ -2917,10 +2426,6 @@ struct DownloadState {
     started_at: Instant,
     duration: Option<Duration>,
     download_dir: std::path::PathBuf,
-    // None for Chromium; HTTP uses the persistent verified-stem journal.
-    c23_previously_verified: Option<std::collections::HashSet<String>>,
-    c23_final_verified: Option<std::collections::HashSet<String>>,
-    c23_report_issue: Option<String>,
 }
 
 struct LogBuffer {
@@ -2958,16 +2463,7 @@ enum ConfirmPayload {
         use_browser: bool,
         intro_click: bool,
         key_shift: i8,
-        resume_available: bool,
     },
-    RestoreSavedSelection {
-        job: kv_core::c23_resume::ResumeJob,
-    },
-    ResetSong {
-        url: String,
-        title: String,
-    },
-    ResetAllProgress,
 }
 
 impl LogBuffer {
@@ -3223,7 +2719,7 @@ fn update_loading_state(app: &mut App) {
                         app.tracks_state.select(Some(0));
                     }
                     app.current_song = Some(song.clone());
-                    app.intro_click = true;
+                    app.intro_click = false;
                     app.key_shift = 0;
                     app.base_key = details.base_key;
                     app.detail_focus = DetailFocus::Tracks;
@@ -3498,16 +2994,12 @@ fn render_recovery_details_overlay(frame: &mut ratatui::Frame, app: &App) {
 
     frame.render_widget(panel, area);
 }
-fn download_confirmation_labels(resume_available: bool) -> &'static [&'static str] {
-    if resume_available {
-        &[" KEEP EXISTING ", " REPLACE EXISTING ", " RESUME ", " CANCEL "]
-    } else {
-        &[" KEEP EXISTING ", " REPLACE EXISTING ", " CANCEL "]
-    }
+fn download_confirmation_labels() -> &'static [&'static str] {
+    &[" DOWNLOAD ", " CANCEL "]
 }
 
-fn download_confirmation_cancel_index(resume_available: bool) -> usize {
-    download_confirmation_labels(resume_available).len() - 1
+fn download_confirmation_cancel_index() -> usize {
+    download_confirmation_labels().len() - 1
 }
 
 #[cfg(test)]
@@ -3545,117 +3037,6 @@ mod c23_staging_startup_cleanup_tests {
     }
 }
 
-#[cfg(test)]
-mod c23_resume_confirmation_tests {
-    use super::{download_confirmation_cancel_index, download_confirmation_labels};
-
-    #[test]
-    fn resume_choice_only_appears_for_matching_job() {
-        assert_eq!(download_confirmation_labels(false).len(), 3);
-        assert!(!download_confirmation_labels(false).contains(&" RESUME "));
-        assert_eq!(download_confirmation_cancel_index(false), 2);
-
-        assert_eq!(download_confirmation_labels(true).len(), 4);
-        assert_eq!(download_confirmation_labels(true)[2], " RESUME ");
-        assert_eq!(download_confirmation_cancel_index(true), 3);
-    }
-}
-
-#[cfg(test)]
-mod c23_saved_selection_restore_tests {
-    use super::*;
-    use kv_core::c23_resume::{ResumeJob, ResumeStore};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn recovery_finds_pending_job_and_applies_only_its_settings() -> Result<()> {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let root = std::env::temp_dir().join(format!("c23-select-{}-{stamp}", std::process::id()));
-        fs::create_dir(&root)?;
-        let song = Song {
-            title: "Test Song".into(), artist: "Test Artist".into(),
-            url: "https://example.test/song".into(),
-            first_seen: 0, purchase_date: 0,
-        };
-        let destination = kvui_select_keyed_song_destination(
-            &root, &song.artist, &song.title, &song.url, -2,
-        )?;
-        fs::create_dir_all(&destination)?;
-        fs::write(destination.join(KVUI_SONG_SOURCE_FILE), song.url.as_bytes())?;
-        let drum_file = destination.join("Drum Kit.mp3");
-        fs::write(&drum_file, b"verified drums")?;
-        let mut job = ResumeJob::new(
-            &song.url, &destination, false, -2,
-            vec!["Drum Kit".into(), "Bass".into()],
-        )?;
-        job.record_completed("Drum Kit", &drum_file)?;
-
-        let mut store = ResumeStore::default();
-        store.upsert(job.clone());
-        let mut app = App::new(Arc::new(Mutex::new(LogBuffer::new(100))));
-        app.download_dir = root.clone();
-        app.current_song = Some(song.clone());
-        app.tracks = vec![
-            Track { name: "Bass".into(), selected: false },
-            Track { name: "Piano".into(), selected: true },
-            Track { name: "Drum Kit".into(), selected: false },
-        ];
-        app.intro_click = true;
-        app.key_shift = 0;
-        app.use_browser = true;
-
-        let matches = c23_restorable_jobs(&song, &app.tracks, &root, &store)?;
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].pending_tracks()?, vec!["Bass"]);
-        c23_apply_saved_selection(&mut app, &matches[0])?;
-        assert_eq!(app.tracks.iter().map(|t| t.selected).collect::<Vec<_>>(), vec![true, false, true]);
-        assert!(!app.intro_click);
-        assert_eq!(app.key_shift, -2);
-        assert!(!app.use_browser);
-        assert!(app.status.contains("Select Download, then Resume"));
-
-        // Other source URLs and other download roots must never be offered.
-        let mut other_song = song.clone();
-        other_song.url = "https://example.test/other".into();
-        assert!(c23_restorable_jobs(&other_song, &app.tracks, &root, &store)?.is_empty());
-        let other_root = root.join("other-root");
-        fs::create_dir(&other_root)?;
-        assert!(c23_restorable_jobs(&song, &app.tracks, &other_root, &store)?.is_empty());
-
-        // A fully completed job cannot be offered as unfinished.
-        fs::write(destination.join("Bass.mp3"), b"verified bass")?;
-        job.record_completed("Bass", &destination.join("Bass.mp3"))?;
-        store.upsert(job);
-        assert!(c23_restorable_jobs(&song, &app.tracks, &root, &store)?.is_empty());
-
-        fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn multiple_unfinished_variants_are_not_implicitly_chosen() -> Result<()> {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let root = std::env::temp_dir().join(format!("c23-multi-{}-{stamp}", std::process::id()));
-        fs::create_dir(&root)?;
-        let song = Song {
-            title: "Test Song".into(), artist: "Test Artist".into(),
-            url: "https://example.test/song".into(),
-            first_seen: 0, purchase_date: 0,
-        };
-        let tracks = vec![Track { name: "Bass".into(), selected: true }];
-        let mut store = ResumeStore::default();
-        for shift in [0, -2] {
-            let destination = kvui_select_keyed_song_destination(
-                &root, &song.artist, &song.title, &song.url, shift,
-            )?;
-            store.upsert(ResumeJob::new(&song.url, &destination, true, shift, vec!["Bass".into()])?);
-        }
-        assert_eq!(c23_restorable_jobs(&song, &tracks, &root, &store)?.len(), 2);
-        fs::remove_dir_all(root)?;
-        Ok(())
-    }
-}
-
 /// Render download choices as neutral text rows with one blank line between.
 /// Only the currently selected choice receives a high-contrast highlight.
 fn download_confirmation_choice_lines(
@@ -3689,31 +3070,15 @@ mod c24_download_confirm_layout_tests {
     use super::*;
 
     #[test]
-    fn four_choices_are_vertical_with_only_selected_choice_highlighted() {
-        let labels = download_confirmation_labels(true);
-        let lines = download_confirmation_choice_lines(labels, 2);
-        assert_eq!(lines.len(), 7); // Four choices and three blank lines.
-        for (index, label) in labels.iter().enumerate() {
-            let row = &lines[index * 2];
-            assert_eq!(row.spans.len(), 1);
-            assert!(row.spans[0].content.contains(label.trim()));
-            assert_eq!(row.spans[0].style.bg, if index == 2 { Some(Color::Yellow) } else { None });
-            if index < 3 {
-                assert!(lines[index * 2 + 1].spans.is_empty());
-            }
-        }
-    }
-
-    #[test]
-    fn three_choices_without_resume_are_vertical_and_preserve_cancel() {
-        let labels = download_confirmation_labels(false);
+    fn download_confirmation_has_only_download_and_cancel() {
+        let labels = download_confirmation_labels();
+        assert_eq!(labels, &[" DOWNLOAD ", " CANCEL "]);
+        assert_eq!(download_confirmation_cancel_index(), 1);
         let lines = download_confirmation_choice_lines(labels, 0);
-        assert_eq!(lines.len(), 5);
-        assert_eq!(download_confirmation_cancel_index(false), 2);
-        assert!(lines[4].spans[0].content.contains("CANCEL"));
+        assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].spans[0].style.bg, Some(Color::Yellow));
+        assert!(lines[1].spans.is_empty());
         assert_eq!(lines[2].spans[0].style.bg, None);
-        assert_eq!(lines[4].spans[0].style.bg, None);
     }
 
     #[test]
@@ -3732,7 +3097,6 @@ mod c24_download_confirm_layout_tests {
                 use_browser: false,
                 intro_click: false,
                 key_shift: 0,
-                resume_available: true,
             },
         });
         handle_confirm_keys(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))?;
@@ -3740,7 +3104,7 @@ mod c24_download_confirm_layout_tests {
         handle_confirm_keys(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))?;
         assert_eq!(app.confirm.as_ref().unwrap().selected, 0);
         handle_confirm_keys(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))?;
-        assert_eq!(app.confirm.as_ref().unwrap().selected, 3); // Up from first choice wraps to Cancel.
+        assert_eq!(app.confirm.as_ref().unwrap().selected, 1); // Up from first choice wraps to Cancel.
         handle_confirm_keys(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))?;
         assert_eq!(app.confirm.as_ref().unwrap().selected, 0);
         Ok(())
@@ -3816,7 +3180,7 @@ mod c24_soft_text_theme_tests {
 
     #[test]
     fn unselected_download_choice_is_gray_but_selected_choice_keeps_gold_fill() {
-        let rows = download_confirmation_choice_lines(&[" Keep Existing ", " Cancel "], 1);
+        let rows = download_confirmation_choice_lines(&[" Download ", " Cancel "], 1);
         assert_eq!(rows[0].spans[0].style.fg, Some(Color::Gray));
         assert_eq!(rows[0].spans[0].style.bg, None);
         assert_eq!(rows[2].spans[0].style.bg, Some(Color::Yellow));
@@ -3907,20 +3271,15 @@ fn render_confirm_overlay(frame: &mut ratatui::Frame, app: &App) {
     let Some(confirm) = &app.confirm else {
         return;
     };
-    let resume_available = match &confirm.payload {
-        ConfirmPayload::StartDownload { resume_available, .. } => *resume_available,
-        _ => false,
-    };
-    let download_confirm =
-        matches!(&confirm.payload, ConfirmPayload::StartDownload { .. });
+    let download_confirm = true;
     // A vertical list needs more space than the old horizontal row.
     let height = if download_confirm { 80 } else { 35 };
-    let area = centered_rect(if resume_available { 90 } else { 70 }, height, frame.size());
+    let area = centered_rect(70, height, frame.size());
     frame.render_widget(Clear, area);
 
     let mut lines = confirmation_intro_lines(&confirm.message, download_confirm);
     let labels: &[&str] = if download_confirm {
-        download_confirmation_labels(resume_available)
+        download_confirmation_labels()
     } else {
         &[" YES ", " NO "]
     };
@@ -4114,12 +3473,7 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
     };
     match key.code {
         KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::Up | KeyCode::Down => {
-            let count = match &confirm.payload {
-                ConfirmPayload::StartDownload { resume_available, .. } => {
-                    download_confirmation_labels(*resume_available).len()
-                }
-                _ => 2,
-            };
+            let count = download_confirmation_labels().len();
 
             confirm.selected = match key.code {
                 KeyCode::Left | KeyCode::Up => (confirm.selected + count - 1) % count,
@@ -4132,221 +3486,157 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
         KeyCode::Enter => {
             let confirm = app.confirm.take().unwrap();
 
-            if let ConfirmPayload::RestoreSavedSelection { job } = &confirm.payload {
-                if confirm.selected == 0 {
-                    if let Err(err) = c23_apply_saved_selection(app, job) {
-                        app.status = format!("Could not restore saved selection: {err}");
-                    }
+            if confirm.selected == download_confirmation_cancel_index() {
+                return Ok(false);
+            }
+
+            // A selected stem is always verified, then safely replaced if present.
+            let file_policy = tasks::download_song::ExistingFilePolicy::Replace;
+            let ConfirmPayload::StartDownload {
+                song,
+                selected_tracks,
+                use_browser,
+                intro_click,
+                key_shift,
+            } = confirm.payload;
+
+            app.log_scroll = 0;
+            app.log_follow = true;
+            let download_dir = app.download_dir.clone();
+            if !download_dir.is_dir() {
+                app.status = format!(
+                    "Download folder is unavailable: {}. Choose a new folder from the main menu.",
+                    download_dir.display()
+                );
+                app.screen = Screen::SongDetail;
+                return Ok(false);
+            }
+            let song_destination = match (|| -> Result<PathBuf> {
+                kvui_check_destination_directory(&download_dir)?;
+                kvui_select_keyed_song_destination(
+                    &download_dir,
+                    &song.artist,
+                    &song.title,
+                    &song.url,
+                    key_shift,
+                )
+            })() {
+                Ok(path) => path,
+                Err(err) => {
+                    app.status = format!("Cannot select song folder: {err}");
+                    app.screen = Screen::SongDetail;
+                    return Ok(false);
                 }
-                return Ok(false);
-            }
-
-            let resume_available = match &confirm.payload {
-                ConfirmPayload::StartDownload { resume_available, .. } => *resume_available,
-                _ => false,
             };
-            let is_download_confirm =
-                matches!(&confirm.payload, ConfirmPayload::StartDownload { .. });
-
-            if is_download_confirm
-                && confirm.selected == download_confirmation_cancel_index(resume_available)
-            {
-                return Ok(false);
+            // UI log history must not mislabel tracks in a later attempt.
+            if let Ok(mut buffer) = app.logs.lock() {
+                buffer.lines.clear();
+                buffer.partial.clear();
             }
-
-            // Phase 2C uses only fresh requests; Resume is never dispatched.
-            let file_policy = if is_download_confirm {
-                Some(if confirm.selected == 0 {
-                    tasks::download_song::ExistingFilePolicy::Keep
-                } else {
-                    tasks::download_song::ExistingFilePolicy::Replace
+            let download_tracks = selected_tracks
+                .iter()
+                .map(|name| TrackStatusItem {
+                    name: name.clone(),
+                    status: TrackStatus::Pending,
+                    attempt: 0,
                 })
-            } else {
-                None
-            };
+                .collect::<Vec<_>>();
+            let song_url = song.url.clone();
+            let song_artist = song.artist.clone();
+            let song_title = song.title.clone();
+            let logs = app.logs.clone();
+            let (published_tx, published_rx) = std::sync::mpsc::channel::<String>();
+            let worker_download_dir = download_dir.clone();
+            let worker_song_destination = song_destination.clone();
+            let handle = std::thread::spawn(move || {
+                let _guard = LogScope::new(logs);
+                if !use_browser {
+                    kvui_prepare_keyed_song_destination(
+                        &worker_download_dir,
+                        &song_artist,
+                        &song_title,
+                        &song_url,
+                        key_shift,
+                        &worker_song_destination,
+                    )?;
 
-            let action_index = if is_download_confirm {
-                0
-            } else {
-                confirm.selected
-            };
-            match action_index {
-                0 => match confirm.payload {
-                    ConfirmPayload::StartDownload {
-                        song,
-                        selected_tracks,
-                        use_browser,
+                    return run_stateless_http_download(
+                        &song_url,
                         intro_click,
                         key_shift,
-                        resume_available: _,
-                    } => {
-                        app.log_scroll = 0;
-                        app.log_follow = true;
-                        let download_dir = app.download_dir.clone();
-                        if !download_dir.is_dir() {
-                            app.status = format!(
-                                "Download folder is unavailable: {}. Choose a new folder from the main menu.",
-                                download_dir.display()
-                            );
-                            app.screen = Screen::SongDetail;
-                            return Ok(false);
-                        }
-                        let song_destination = match (|| -> Result<PathBuf> {
-                            kvui_check_destination_directory(&download_dir)?;
-                            kvui_select_keyed_song_destination(
-                                &download_dir,
-                                &song.artist,
-                                &song.title,
-                                &song.url,
-                                key_shift,
-                            )
-                        })() {
-                            Ok(path) => path,
-                            Err(err) => {
-                                app.status = format!("Cannot select song folder: {err}");
-                                app.screen = Screen::SongDetail;
-                                return Ok(false);
-                            }
-                        };
-                        // Phase 2C never reads C23 history for current-run results.
-                        let c23_previously_verified = None;
-
-                        // UI log history must not mislabel tracks in a later attempt.
-                        if let Ok(mut buffer) = app.logs.lock() {
-                            buffer.lines.clear();
-                            buffer.partial.clear();
-                        }
-                        let download_tracks = selected_tracks
-                            .iter()
-                            .map(|name| TrackStatusItem {
-                                name: name.clone(),
-                                status: TrackStatus::Pending,
-                                attempt: 0,
-                            })
-                            .collect::<Vec<_>>();
-                        let song_url = song.url.clone();
-                        let song_artist = song.artist.clone();
-                        let song_title = song.title.clone();
-                        let logs = app.logs.clone();
-                        let (published_tx, published_rx) = std::sync::mpsc::channel::<String>();
-                        let worker_download_dir = download_dir.clone();
-                        let worker_song_destination = song_destination.clone();
-                        let handle = std::thread::spawn(move || {
-                            let _guard = LogScope::new(logs);
-                            if !use_browser {
-                                kvui_prepare_keyed_song_destination(
-                                    &worker_download_dir,
-                                    &song_artist,
-                                    &song_title,
-                                    &song_url,
-                                    key_shift,
-                                    &worker_song_destination,
-                                )?;
-
-                                return run_stateless_http_download(
-                                    &song_url,
-                                    intro_click,
-                                    key_shift,
-                                    selected_tracks,
-                                    &worker_download_dir,
-                                    &worker_song_destination,
-                                    file_policy.ok_or_else(|| {
-                                        anyhow!("Missing download policy")
-                                    })?,
-                                    published_tx,
-                                );
-                            }
-
-                            let prepared = prepare_staged_download(
-                                &song_url,
-                                use_browser,
-                                intro_click,
-                                key_shift,
-                                selected_tracks,
-                                &worker_download_dir,
-                            )?;
-
-                            kvui_prepare_keyed_song_destination(
-                                &worker_download_dir,
-                                &song_artist,
-                                &song_title,
-                                &song_url,
-                                key_shift,
-                                &worker_song_destination,
-                            )?;
-                            let mut created = 0usize;
-                            let mut replaced = 0usize;
-                            let mut kept = 0usize;
-
-                            for staged in &prepared.files {
-                                let outcome = tasks::download_song::publish_staged_file(
-                                    staged,
-                                    &worker_song_destination,
-                                    file_policy.ok_or_else(|| anyhow!("Missing download policy"))?,
-                                )?;
-
-                                match outcome {
-                                    tasks::download_song::PublishOutcome::Created => {
-                                        created += 1;
-                                    }
-                                    tasks::download_song::PublishOutcome::Replaced => {
-                                        replaced += 1;
-                                    }
-                                    tasks::download_song::PublishOutcome::KeptExisting => {
-                                        kept += 1;
-                                    }
-                                }
-                            }
-
-                            // Release the active lock before deleting its file.
-                            drop(prepared.lock_file);
-                            fs::remove_dir_all(&prepared.staging_dir)?;
-
-                            tracing::info!(
-                                "Protected download: {} new, {} replaced, {} kept",
-                                created, replaced, kept
-                            );
-
-                            Ok(())
-                        });
-                        app.download = Some(DownloadState {
-                            song,
-                            count_in: intro_click,
-                            transpose: key_shift,
-                            tracks: download_tracks,
-                            handle: Some(handle),
-                            published_rx: if use_browser { None } else { Some(published_rx) },
-                            done: None,
-                            started_at: Instant::now(),
-                            duration: None,
-                            download_dir: song_destination,
-                            c23_previously_verified,
-                            c23_final_verified: None,
-                            c23_report_issue: None,
-                        });
-                        app.screen = Screen::DownloadStatus;
-                    }
-                    ConfirmPayload::ResetSong { url, title } => {
-                        let progress = kv_core::download_progress::DownloadProgress::new();
-                        if progress.clear_song(&url)? {
-                            tracing::info!("Reset download progress for {}", url);
-                            app.status = format!("Reset download progress for '{}'", title);
-                        } else {
-                            app.status = format!("No saved download progress found for '{}'", title);
-                        }
-                        app.screen = Screen::Menu;
-                    }
-                    ConfirmPayload::ResetAllProgress => {
-                        let progress = kv_core::download_progress::DownloadProgress::new();
-                        let path = progress.path().display().to_string();
-                        progress.clear()?;
-                        tracing::info!("Deleted download progress file {}", path);
-                        app.status = "All download progress reset".to_string();
-                    }
-                    ConfirmPayload::RestoreSavedSelection { .. } => {}
+                        selected_tracks,
+                        &worker_download_dir,
+                        &worker_song_destination,
+                        file_policy,
+                        published_tx,
+                    );
                 }
-                _ => {}
-            }
+
+                let prepared = prepare_staged_download(
+                    &song_url,
+                    use_browser,
+                    intro_click,
+                    key_shift,
+                    selected_tracks,
+                    &worker_download_dir,
+                )?;
+
+                kvui_prepare_keyed_song_destination(
+                    &worker_download_dir,
+                    &song_artist,
+                    &song_title,
+                    &song_url,
+                    key_shift,
+                    &worker_song_destination,
+                )?;
+                let mut created = 0usize;
+                let mut replaced = 0usize;
+                let mut kept = 0usize;
+
+                for staged in &prepared.files {
+                    let outcome = tasks::download_song::publish_staged_file(
+                        staged,
+                        &worker_song_destination,
+                        file_policy,
+                    )?;
+
+                    match outcome {
+                        tasks::download_song::PublishOutcome::Created => {
+                            created += 1;
+                        }
+                        tasks::download_song::PublishOutcome::Replaced => {
+                            replaced += 1;
+                        }
+                        tasks::download_song::PublishOutcome::KeptExisting => {
+                            kept += 1;
+                        }
+                    }
+                }
+
+                // Release the active lock before deleting its file.
+                drop(prepared.lock_file);
+                fs::remove_dir_all(&prepared.staging_dir)?;
+
+                tracing::info!(
+                    "Protected download: {} new, {} replaced, {} kept",
+                    created, replaced, kept
+                );
+
+                Ok(())
+            });
+            app.download = Some(DownloadState {
+                song,
+                count_in: intro_click,
+                transpose: key_shift,
+                tracks: download_tracks,
+                handle: Some(handle),
+                published_rx: if use_browser { None } else { Some(published_rx) },
+                done: None,
+                started_at: Instant::now(),
+                duration: None,
+                download_dir: song_destination,
+            });
+            app.screen = Screen::DownloadStatus;
         }
         _ => {}
     }
@@ -5808,129 +5098,23 @@ mod keyed_song_destination_tests {
 }
 
 #[cfg(test)]
-mod c23_completion_reporting_tests {
+mod stateless_download_ui_tests {
     use super::*;
-    use kv_core::c23_resume::{ResumeJob, ResumeStore};
-    use std::collections::HashSet;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_root() -> PathBuf {
-        let unique = SystemTime::now().duration_since(UNIX_EPOCH)
-            .unwrap().as_nanos();
-        std::env::temp_dir().join(format!("kvui-c23-report-{}-{unique}", std::process::id()))
-    }
-
-    fn make_download(
-        root: &Path,
-        previously: &[&str],
-        verified: &[&str],
-        statuses: &[TrackStatus],
-    ) -> DownloadState {
-        let names = ["Drum Kit", "Bass", "Acoustic Guitar", "Electric Guitar"];
-        DownloadState {
-            song: Song {
-                title: "Take It Easy".into(), artist: "Eagles".into(),
-                url: "https://example.test/song".into(),
-                first_seen: 0, purchase_date: 0,
-            },
-            count_in: true, transpose: 0,
-            tracks: names.iter().zip(statuses.iter()).map(|(name, status)| {
-                TrackStatusItem { name: (*name).into(), status: status.clone(), attempt: 0 }
-            }).collect(),
-            handle: None, published_rx: None, done: Some(Ok(())),
-            started_at: Instant::now(), duration: None,
-            download_dir: root.to_path_buf(),
-            c23_previously_verified: Some(previously.iter().map(|s| s.to_lowercase()).collect()),
-            c23_final_verified: Some(verified.iter().map(|s| s.to_lowercase()).collect()),
-            c23_report_issue: None,
-        }
+    #[test]
+    fn intro_click_defaults_off_and_legacy_progress_menu_is_absent() {
+        let app = App::new(Arc::new(Mutex::new(LogBuffer::new(20))));
+        assert!(!app.intro_click);
+        assert!(!app.menu_items.iter().any(|item| item.contains("Progress")));
     }
 
     #[test]
-    fn resume_success_counts_previously_and_newly_verified() {
-        let root = temp_root();
-        let prior = ["Drum Kit", "Acoustic Guitar", "Electric Guitar"];
-        let all = ["Drum Kit", "Bass", "Acoustic Guitar", "Electric Guitar"];
-        let state = make_download(&root, &prior, &all,
-            &[TrackStatus::Done, TrackStatus::Done, TrackStatus::Done, TrackStatus::Done]);
-        assert_eq!(c23_completion_counts(&state), Some(C23CompletionCounts {
-            previously_verified: 3, newly_verified: 1, failed: 0, pending: 0,
-        }));
-    }
-
-    #[test]
-    fn failed_resume_does_not_hide_saved_stems() {
-        let root = temp_root();
-        let prior = ["Drum Kit", "Acoustic Guitar", "Electric Guitar"];
-        let state = make_download(&root, &prior, &prior,
-            &[TrackStatus::Done, TrackStatus::Failed, TrackStatus::Done, TrackStatus::Done]);
-        assert_eq!(c23_completion_counts(&state), Some(C23CompletionCounts {
-            previously_verified: 3, newly_verified: 0, failed: 1, pending: 0,
-        }));
-    }
-
-    #[test]
-    fn pending_is_not_misreported_as_failed() {
-        let root = temp_root();
-        let prior = ["Drum Kit"];
-        let state = make_download(&root, &prior, &prior,
-            &[TrackStatus::Done, TrackStatus::Failed, TrackStatus::Pending, TrackStatus::Pending]);
-        assert_eq!(c23_completion_counts(&state), Some(C23CompletionCounts {
-            previously_verified: 1, newly_verified: 0, failed: 1, pending: 2,
-        }));
-    }
-
-    #[test]
-    fn fresh_download_counts_only_newly_verified() {
-        let root = temp_root();
-        let newly = ["Drum Kit", "Bass"];
-        let state = make_download(&root, &[], &newly,
-            &[TrackStatus::Done, TrackStatus::Done, TrackStatus::Pending, TrackStatus::Pending]);
-        assert_eq!(c23_completion_counts(&state), Some(C23CompletionCounts {
-            previously_verified: 0, newly_verified: 2, failed: 0, pending: 2,
-        }));
-    }
-
-    #[test]
-    fn invalidated_previously_verified_stem_is_not_counted() {
-        let root = temp_root();
-        let prior = ["Drum Kit", "Acoustic Guitar"];
-        let actually_verified = ["Drum Kit"];
-        let state = make_download(&root, &prior, &actually_verified,
-            &[TrackStatus::Done, TrackStatus::Pending, TrackStatus::Pending, TrackStatus::Pending]);
-        assert_eq!(c23_completion_counts(&state), Some(C23CompletionCounts {
-            previously_verified: 1, newly_verified: 0, failed: 0, pending: 3,
-        }));
-    }
-
-    #[test]
-    fn journal_snapshot_only_counts_hash_verified_exact_request() -> Result<()> {
-        let root = temp_root();
-        fs::create_dir_all(&root)?;
-        let drum = root.join("Drum Kit.mp3");
-        fs::write(&drum, b"known good")?;
-        let names = vec!["Drum Kit".into(), "Bass".into()];
-        let mut job = ResumeJob::new("https://example.test/song", &root, true, 0, names.clone())?;
-        job.record_completed("Drum Kit", &drum)?;
-        let mut store = ResumeStore::default();
-        store.upsert(job);
-
-        let snapshot = c23_verified_from_store(
-            &store, "https://example.test/song", &root, true, 0, &names
-        )?.unwrap();
-        assert_eq!(snapshot, HashSet::from(["drum kit".to_string()]));
-        assert!(c23_verified_from_store(
-            &store, "https://example.test/another", &root, true, 0, &names
-        )?.is_none());
-        assert!(c23_verified_from_store(
-            &store, "https://example.test/song", &root, true, 1, &names
-        )?.is_none());
-
-        fs::write(&drum, b"changed data")?;
-        assert!(c23_verified_from_store(
-            &store, "https://example.test/song", &root, true, 0, &names
-        )?.unwrap().is_empty());
-        fs::remove_dir_all(&root)?;
-        Ok(())
+    fn current_run_report_counts_only_selected_track_statuses() {
+        let tracks = [TrackStatus::Done, TrackStatus::Failed, TrackStatus::Pending,
+            TrackStatus::Downloading];
+        let items = tracks.iter().enumerate().map(|(index, status)| TrackStatusItem {
+            name: format!("Track {index}"), status: status.clone(), attempt: 0,
+        }).collect::<Vec<_>>();
+        assert_eq!(count_current_download_results(&items), (1, 1, 2));
     }
 }
