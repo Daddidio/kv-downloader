@@ -1803,11 +1803,12 @@ fn run_stateless_http_download(
         force_restart: false,
     };
 
-    let result = tasks::download_song::download_song_http_stateless_with_hook(
+    let result = tasks::download_song::download_song_http_stateless_with_cached_copy_hook(
         song_url,
         options,
         Some(staging.to_string_lossy().into_owned()),
         &domain,
+        song_destination,
         &mut |track, staged_file| {
             let outcome = tasks::download_song::publish_single_staged_track(
                 staged_file,

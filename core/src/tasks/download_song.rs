@@ -16,7 +16,7 @@ use reqwest::header::{HeaderMap, HeaderValue, REFERER};
 use std::fmt::Display;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::{env, error::Error, thread::sleep, time::Duration, time::SystemTime};
@@ -723,7 +723,7 @@ pub fn download_song_http_with_hook(
     ) -> Result<PathBuf>,
 ) -> Result<()> {
     download_song_http_internal(
-        url, options, download_path, domain, on_track_completed, true,
+        url, options, download_path, domain, on_track_completed, true, None,
     )
 }
 
@@ -742,7 +742,24 @@ pub fn download_song_http_stateless_with_hook(
     ) -> Result<PathBuf>,
 ) -> Result<()> {
     download_song_http_internal(
+        url, options, download_path, domain, on_track_completed, false, None,
+    )
+}
+
+/// KVUI-only opt-in for a server-reused MP3. An older Last-Modified timestamp
+/// is accepted only when the full response is byte-identical to the already
+/// present file for the verified song/track/key. The CLI remains strict.
+pub fn download_song_http_stateless_with_cached_copy_hook(
+    url: &str,
+    options: DownloadOptions,
+    download_path: Option<String>,
+    domain: &str,
+    cached_existing_dir: &Path,
+    on_track_completed: &mut dyn FnMut(&str, &Path) -> Result<PathBuf>,
+) -> Result<()> {
+    download_song_http_internal(
         url, options, download_path, domain, on_track_completed, false,
+        Some(cached_existing_dir),
     )
 }
 
@@ -756,6 +773,7 @@ fn download_song_http_internal(
         &std::path::Path,
     ) -> Result<PathBuf>,
     track_history: bool,
+    cached_existing_dir: Option<&Path>,
 ) -> Result<()> {
     let progress = if track_history {
         Some(DownloadProgress::new_with_path(download_path.as_deref()))
@@ -880,6 +898,7 @@ fn download_song_http_internal(
                     options.transpose,
                     &download_dir,
                     first_requested_at,
+                    cached_existing_dir,
                 ) {
                     Err(err) if err.downcast_ref::<ChallengeError>().is_some() => {
                         challenge_refreshes += 1;
@@ -1018,6 +1037,7 @@ fn download_http_track(
     transpose: i8,
     download_dir: &std::path::Path,
     first_requested_at: SystemTime,
+    cached_existing_dir: Option<&Path>,
 ) -> Result<(String, PathBuf, Option<String>)> {
     let trackslevels = song_meta.build_trackslevels_solo(level_index)?;
     if env::var("KV_HTTP_DEBUG").ok().as_deref() == Some("1") {
@@ -1071,13 +1091,19 @@ fn download_http_track(
         .map_err(|e| anyhow!("Failed to decode filename: {}", e))?
         .to_string();
 
+    // Do not use a server-provided path component outside the staging folder.
+    if Path::new(&decoded).file_name().and_then(|n| n.to_str()) != Some(decoded.as_str()) {
+        return Err(anyhow!("Unsafe server MP3 filename"));
+    }
     let file_path = download_dir.join(&decoded);
+    let existing_copy = cached_existing_dir.map(|dir| dir.join(&decoded));
     tracing::info!("Downloading '{}'", decoded);
     let etag = download_file(
         client,
         &file_url,
         &file_path,
         first_requested_at,
+        existing_copy.as_deref(),
     )?;
     Ok((decoded, file_path, etag))
 }
@@ -1943,11 +1969,89 @@ mod c22c2_freshness_tests {
         assert!(!http_etag_is_reused(&accepted, None));
     }
 }
+/// A server-cached MP3 is usable only when it is an exact copy of an
+/// already-existing, regular MP3 at the verified destination. This is not a
+/// substitute for detecting changed mixer options; KVUI must still test those
+/// separately before the new downloader is installed.
+fn cached_mp3_matches_existing(
+    staged: &Path,
+    existing: &Path,
+    server_modified: SystemTime,
+) -> Result<bool> {
+    let existing_meta = match std::fs::symlink_metadata(existing) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    if !existing_meta.file_type().is_file() || existing_meta.file_type().is_symlink() {
+        return Ok(false);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if existing_meta.file_attributes() & 0x400 != 0 {
+            return Ok(false);
+        }
+    }
+    // A local copy cannot have been downloaded from a server file created
+    // after that local file's own modification time (allow 2s clock margin).
+    if existing_meta.modified()? + Duration::from_secs(2) < server_modified {
+        return Ok(false);
+    }
+    files_are_identical(existing, staged)
+}
+
+#[cfg(test)]
+mod cached_mp3_tests {
+    use super::cached_mp3_matches_existing;
+    use std::fs;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn only_accepts_a_byte_identical_existing_regular_file() {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "kvui-cached-mp3-{}-{}", std::process::id(), unique
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let existing = root.join("Bass.mp3");
+        let staged = root.join("staged.mp3");
+        fs::write(&existing, b"previously accepted bass MP3").unwrap();
+        fs::write(&staged, b"previously accepted bass MP3").unwrap();
+        let server_modified = fs::metadata(&existing).unwrap().modified().unwrap()
+            - Duration::from_secs(5);
+        assert!(cached_mp3_matches_existing(&staged, &existing, server_modified).unwrap());
+        fs::write(&staged, b"different audio -- possibly wrong instrument").unwrap();
+        assert!(!cached_mp3_matches_existing(&staged, &existing, server_modified).unwrap());
+        fs::remove_file(&existing).unwrap();
+        assert!(!cached_mp3_matches_existing(&staged, &existing, server_modified).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_reference_that_predates_the_server_file() {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "kvui-cache-old-copy-{}-{}", std::process::id(), unique
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let existing = root.join("Bass.mp3");
+        let staged = root.join("staged.mp3");
+        fs::write(&existing, b"same bytes").unwrap();
+        fs::write(&staged, b"same bytes").unwrap();
+        let server_modified = fs::metadata(&existing).unwrap().modified().unwrap()
+            + Duration::from_secs(60);
+        assert!(!cached_mp3_matches_existing(&staged, &existing, server_modified).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 fn download_file(
     client: &Client,
     url: &str,
     path: &PathBuf,
     first_requested_at: SystemTime,
+    cached_existing: Option<&Path>,
 ) -> Result<Option<String>> {
     let response_started = std::time::Instant::now();
     let mut resp = client.get(url).send()?;
@@ -1999,7 +2103,8 @@ fn download_file(
             err
         ))?;
 
-    if !http_server_file_is_fresh(modified_at, first_requested_at) {
+    let is_fresh = http_server_file_is_fresh(modified_at, first_requested_at);
+    if !is_fresh && cached_existing.is_none() {
         tracing::warn!(
             "C22C-2 rejected stale MP3: server Last-Modified predates the original instrument request"
         );
@@ -2016,6 +2121,22 @@ fn download_file(
 
     let mut file = std::fs::File::create(path)?;
     std::io::copy(&mut resp, &mut file)?;
+    drop(file);
+    if !is_fresh {
+        let existing = cached_existing.expect("checked before downloading");
+        if !cached_mp3_matches_existing(path, existing, modified_at)? {
+            let _ = std::fs::remove_file(path);
+            tracing::warn!(
+                "C22C-2 rejected stale MP3: body differs from existing verified song/track file"
+            );
+            return Err(anyhow!(
+                "C22C-2 server file is stale and differs from the existing track"
+            ));
+        }
+        tracing::info!(
+            "C22C-2 accepted server-reused MP3: byte-identical to existing song/track file"
+        );
+    }
     Ok(accepted_etag)
 }
 
