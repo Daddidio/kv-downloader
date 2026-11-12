@@ -2129,40 +2129,109 @@ pub enum PublishOutcome {
 }
 
 /// Publish a verified download from staging into the destination folder.
-/// Staging must be on the same filesystem as the destination.
+/// Staging must be on the same filesystem as the destination. The caller
+/// verifies that the MP3 matches the requested instrument/key before publishing.
 pub fn publish_staged_file(
     staged: &std::path::Path,
     destination_dir: &std::path::Path,
     policy: ExistingFilePolicy,
 ) -> Result<PublishOutcome> {
+    publish_staged_file_with_rename(staged, destination_dir, policy, &mut |from, to| std::fs::rename(from, to))
+}
+
+/// A filesystem-operation seam permits deterministic rollback tests without
+/// changing the production publishing path.
+fn publish_staged_file_with_rename(
+    staged: &std::path::Path,
+    destination_dir: &std::path::Path,
+    policy: ExistingFilePolicy,
+    rename: &mut dyn FnMut(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> Result<PublishOutcome> {
     let filename = staged
         .file_name()
         .ok_or_else(|| anyhow!("Staged file has no filename"))?;
 
-    let metadata = std::fs::metadata(staged)?;
-    if !metadata.is_file() || metadata.len() == 0 {
-        return Err(anyhow!("Staged file is empty or invalid"));
+    // Do not follow a staged-file symlink or move an empty/unready download.
+    let metadata = std::fs::symlink_metadata(staged)?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 {
+        return Err(anyhow!("Staged file is empty, linked, or invalid"));
     }
 
     let destination = destination_dir.join(filename);
-    let existed = destination.exists();
-
-    if existed {
-        if !destination.is_file() {
-            return Err(anyhow!("Destination is not a file"));
+    let existing = match std::fs::symlink_metadata(&destination) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(anyhow!("Destination is not a regular file"));
+            }
+            true
         }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => return Err(err.into()),
+    };
 
-        if policy == ExistingFilePolicy::Keep {
-            return Ok(PublishOutcome::KeptExisting);
-        }
+    if !existing {
+        rename(staged, &destination)?;
+        return Ok(PublishOutcome::Created);
     }
 
-    std::fs::rename(staged, &destination)?;
+    if policy == ExistingFilePolicy::Keep {
+        return Ok(PublishOutcome::KeptExisting);
+    }
 
-    if existed {
-        Ok(PublishOutcome::Replaced)
-    } else {
-        Ok(PublishOutcome::Created)
+    // Windows cannot reliably rename over an existing file. Preserve the old
+    // MP3 at a uniquely named sibling path before moving the verified replacement.
+    // A crash between moves can leave this backup behind for manual recovery.
+    let stamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+    let backup = (0..32)
+        .map(|attempt| {
+            destination_dir.join(format!(
+                ".kvui-backup-{}-{stamp}-{attempt}.mp3",
+                std::process::id()
+            ))
+        })
+        .find(|path| matches!(
+            std::fs::symlink_metadata(path),
+            Err(ref err) if err.kind() == std::io::ErrorKind::NotFound
+        ))
+        .ok_or_else(|| anyhow!("Could not reserve a unique replacement backup path"))?;
+
+    rename(&destination, &backup).map_err(|err| {
+        anyhow!("Could not protect original file {}: {err}", destination.display())
+    })?;
+
+    match rename(staged, &destination) {
+        Ok(()) => {
+            // The new MP3 is now in place. A failed backup cleanup is not a
+            // failed download; leave the recoverable original and warn.
+            if let Err(err) = std::fs::remove_file(&backup) {
+                tracing::warn!(
+                    "Replacement succeeded, but original backup remains at {}: {}",
+                    backup.display(), err
+                );
+            }
+            Ok(PublishOutcome::Replaced)
+        }
+        Err(publish_err) => {
+            // Avoid overwriting a file that another actor created in the gap.
+            if std::fs::symlink_metadata(&destination).is_ok() {
+                return Err(anyhow!(
+                    "Replacement failed: {publish_err}. Original preserved at {}. Destination {} now exists; manual recovery required.",
+                    backup.display(), destination.display()
+                ));
+            }
+            match rename(&backup, &destination) {
+                Ok(()) => Err(anyhow!(
+                    "Replacement failed for {}: {publish_err}. Original restored.",
+                    destination.display()
+                )),
+                Err(restore_err) => Err(anyhow!(
+                    "Replacement failed for {}: {publish_err}. Automatic restore failed: {restore_err}. Original preserved at {}.",
+                    destination.display(), backup.display()
+                )),
+            }
+        }
     }
 }
 
@@ -2235,6 +2304,105 @@ mod safe_publish_tests {
             b"new drums"
         );
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_staged_file_does_not_touch_existing_file() {
+        let root = std::env::temp_dir().join(format!(
+            "kv-publish-invalid-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let staging = root.join("staging");
+        let destination = root.join("destination");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let staged = staging.join("Bass.mp3");
+        let original = destination.join("Bass.mp3");
+        fs::write(&original, b"original").unwrap();
+        fs::write(&staged, b"").unwrap();
+
+        assert!(publish_staged_file(&staged, &destination, ExistingFilePolicy::Replace).is_err());
+        assert_eq!(fs::read(&original).unwrap(), b"original");
+        assert_eq!(fs::metadata(&staged).unwrap().len(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replacement_failure_restores_original_and_preserves_staged() {
+        let root = std::env::temp_dir().join(format!(
+            "kv-publish-rollback-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let staging = root.join("staging");
+        let destination = root.join("destination");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let staged = staging.join("Bass.mp3");
+        let original = destination.join("Bass.mp3");
+        let unselected = destination.join("Piano.mp3");
+        fs::write(&staged, b"new bass").unwrap();
+        fs::write(&original, b"old bass").unwrap();
+        fs::write(&unselected, b"keep piano").unwrap();
+        let mut moves = 0;
+        let err = publish_staged_file_with_rename(
+            &staged, &destination, ExistingFilePolicy::Replace,
+            &mut |from, to| {
+                moves += 1;
+                if moves == 2 {
+                    Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected failure"))
+                } else {
+                    fs::rename(from, to)
+                }
+            },
+        ).unwrap_err();
+        assert!(err.to_string().contains("Original restored"));
+        assert_eq!(moves, 3);
+        assert_eq!(fs::read(&original).unwrap(), b"old bass");
+        assert_eq!(fs::read(&staged).unwrap(), b"new bass");
+        assert_eq!(fs::read(&unselected).unwrap(), b"keep piano");
+        assert!(!fs::read_dir(&destination).unwrap().any(|entry| {
+            entry.unwrap().file_name().to_string_lossy().starts_with(".kvui-backup-")
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_automatic_restore_keeps_recoverable_backup() {
+        let root = std::env::temp_dir().join(format!(
+            "kv-publish-backup-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let staging = root.join("staging");
+        let destination = root.join("destination");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let staged = staging.join("Bass.mp3");
+        let original = destination.join("Bass.mp3");
+        fs::write(&staged, b"new bass").unwrap();
+        fs::write(&original, b"old bass").unwrap();
+        let mut moves = 0;
+        let err = publish_staged_file_with_rename(
+            &staged, &destination, ExistingFilePolicy::Replace,
+            &mut |from, to| {
+                moves += 1;
+                if moves >= 2 {
+                    Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected failure"))
+                } else {
+                    fs::rename(from, to)
+                }
+            },
+        ).unwrap_err();
+        assert!(err.to_string().contains("Original preserved at"));
+        assert_eq!(fs::read(&staged).unwrap(), b"new bass");
+        let backup = fs::read_dir(&destination).unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.file_name().unwrap().to_string_lossy().starts_with(".kvui-backup-"))
+            .unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), b"old bass");
         fs::remove_dir_all(root).unwrap();
     }
 }
