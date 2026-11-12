@@ -722,13 +722,54 @@ pub fn download_song_http_with_hook(
         &std::path::Path,
     ) -> Result<PathBuf>,
 ) -> Result<()> {
-    let progress = DownloadProgress::new_with_path(download_path.as_deref());
-    if options.force_restart {
-        tracing::info!("Force restart requested, clearing previous progress");
-        progress.clear()?;
+    download_song_http_internal(
+        url, options, download_path, domain, on_track_completed, true,
+    )
+}
+
+/// Run the existing HTTP verification/retry pipeline without reading or writing
+/// legacy DownloadProgress records. KVUI will use this entry point after its
+/// safe-replacement and current-operation reporting paths are ready.
+/// The older entry point above retains its behavior for current callers.
+pub fn download_song_http_stateless_with_hook(
+    url: &str,
+    options: DownloadOptions,
+    download_path: Option<String>,
+    domain: &str,
+    on_track_completed: &mut dyn FnMut(
+        &str,
+        &std::path::Path,
+    ) -> Result<PathBuf>,
+) -> Result<()> {
+    download_song_http_internal(
+        url, options, download_path, domain, on_track_completed, false,
+    )
+}
+
+fn download_song_http_internal(
+    url: &str,
+    options: DownloadOptions,
+    download_path: Option<String>,
+    domain: &str,
+    on_track_completed: &mut dyn FnMut(
+        &str,
+        &std::path::Path,
+    ) -> Result<PathBuf>,
+    track_history: bool,
+) -> Result<()> {
+    let progress = if track_history {
+        Some(DownloadProgress::new_with_path(download_path.as_deref()))
+    } else {
+        None
+    };
+    if let Some(progress) = progress.as_ref() {
+        if options.force_restart {
+            tracing::info!("Force restart requested, clearing previous progress");
+            progress.clear()?;
+        }
+        progress.set_download(url, options.count_in, options.transpose)?;
+        progress.log_resume_status()?;
     }
-    progress.set_download(url, options.count_in, options.transpose)?;
-    progress.log_resume_status()?;
 
     let cookie = Keystore::get_auth_cookie_value()
         .map_err(|_| anyhow!("Missing session cookie. Run `kv-downloader auth` first."))?;
@@ -805,13 +846,15 @@ pub fn download_song_http_with_hook(
             continue;
         }
 
-        if progress.is_track_downloaded(track_name)? {
-            tracing::info!(
-                "Skipping '{}' (recorded as completed in {})",
-                track_name,
-                progress.path().display()
-            );
-            continue;
+        if let Some(progress) = progress.as_ref() {
+            if progress.is_track_downloaded(track_name)? {
+                tracing::info!(
+                    "Skipping '{}' (recorded as completed in {})",
+                    track_name,
+                    progress.path().display()
+                );
+                continue;
+            }
         }
 
         if requested_any {
@@ -898,7 +941,9 @@ pub fn download_song_http_with_hook(
                         ));
                     }
 
-                    progress.mark_track_downloaded(track_name)?;
+                    if let Some(progress) = progress.as_ref() {
+                        progress.mark_track_downloaded(track_name)?;
+                    }
                     if let Some(etag) = etag {
                         accepted_etags.insert(etag);
                     }
@@ -931,8 +976,9 @@ pub fn download_song_http_with_hook(
             consecutive_failures += 1;
             if consecutive_failures >= MAX_CONSECUTIVE_TRACK_FAILURES {
                 tracing::error!(
-                    "{} tracks in a row failed; stopping this song. Re-run later to resume.",
-                    consecutive_failures
+                    "{} tracks in a row failed; stopping this song. {}",
+                    consecutive_failures,
+                    if track_history { "Re-run later to resume." } else { "Re-run to retry failed tracks." }
                 );
                 break;
             }
@@ -940,11 +986,21 @@ pub fn download_song_http_with_hook(
     }
 
     if failed_tracks.is_empty() {
-        tracing::info!("Download complete; progress retained for future runs");
+        if track_history {
+            tracing::info!("Download complete; progress retained for future runs");
+        } else {
+            tracing::info!("Download complete; no historical track state was used");
+        }
         Ok(())
-    } else {
+    } else if track_history {
         Err(anyhow!(
             "{} track(s) failed after retries: {}. Completed tracks were saved and will be skipped next time.",
+            failed_tracks.len(),
+            failed_tracks.join(", ")
+        ))
+    } else {
+        Err(anyhow!(
+            "{} track(s) failed after retries: {}. Completed tracks were saved.",
             failed_tracks.len(),
             failed_tracks.join(", ")
         ))
