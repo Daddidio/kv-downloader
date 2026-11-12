@@ -393,6 +393,7 @@ fn configure_demo_screen(app: &mut App, screen: DemoScreen) {
                 transpose: 0,
                 tracks,
                 handle: None,
+                published_rx: None,
                 done: complete.then_some(Err(
                     "1 track failed after retries; completed tracks were saved.".to_string(),
                 )),
@@ -963,24 +964,8 @@ fn handle_detail_keys(
                         app.status = "Select at least one track to download".to_string();
                         return Ok(false);
                     }
-                    // Resume is HTTP-only and requires an exact unfinished job.
-                    let resume_available = if app.use_browser {
-                        false
-                    } else {
-                        match c23_resume_is_available(
-                            &song,
-                            &selected_tracks,
-                            &app.download_dir,
-                            app.intro_click,
-                            app.key_shift,
-                        ) {
-                            Ok(available) => available,
-                            Err(err) => {
-                                app.status = format!("Cannot check resume availability: {err}");
-                                return Ok(false);
-                            }
-                        }
-                    };
+                    // Stateless downloads never consult historical Resume jobs.
+                    let resume_available = false;
                     app.confirm = Some(ConfirmState {
                         message: if app.use_browser {
                             vec![
@@ -1025,6 +1010,18 @@ mod c24_navigation_selection_tests {
 
     fn test_app() -> App {
         App::new(Arc::new(Mutex::new(LogBuffer::new(20))))
+    }
+
+    #[test]
+    fn http_publication_event_overrides_log_based_pending_state() {
+        let mut app = test_app();
+        configure_demo_screen(&mut app, DemoScreen::Download);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.download.as_mut().unwrap().published_rx = Some(rx);
+        // Piano is initially Downloading. A publication event is authoritative.
+        tx.send("Piano".to_string()).unwrap();
+        update_download_state(&mut app);
+        assert_eq!(app.download.as_ref().unwrap().tracks[5].status, TrackStatus::Done);
     }
 
     #[test]
@@ -1761,7 +1758,10 @@ fn render_download_done(frame: &mut ratatui::Frame, app: &mut App) {
             .filter(|track| track.status == TrackStatus::Done).count();
         let failed = download.tracks.iter()
             .filter(|track| track.status == TrackStatus::Failed).count();
-        lines.push(Line::from(format!("Tracks: {} completed, {} failed", completed, failed)));
+        let pending = download.tracks.len() - completed - failed;
+        lines.push(Line::from(format!(
+            "Tracks: {} completed, {} failed, {} pending", completed, failed, pending
+        )));
         for track in &download.tracks {
             let marker = match track.status {
                 TrackStatus::Done => "✓",
@@ -2162,6 +2162,69 @@ fn c23_apply_saved_selection(
         job.selected_tracks.len()
     );
     Ok(())
+}
+
+/// Phase 2C: download every selected HTTP stem without consulting either
+/// historical progress tracker or C23 Resume. Each accepted stem is checked
+/// against the requested name and key before independent safe publication.
+fn run_stateless_http_download(
+    song_url: &str,
+    count_in: bool,
+    transpose: i8,
+    selected_tracks: Vec<String>,
+    download_root: &Path,
+    song_destination: &Path,
+    policy: tasks::download_song::ExistingFilePolicy,
+    published: std::sync::mpsc::Sender<String>,
+) -> Result<()> {
+    let domain = extract_domain_from_url(song_url)
+        .ok_or_else(|| anyhow!("Missing domain from URL"))?;
+
+    cleanup_abandoned_staging(download_root)?;
+    let staging = tasks::download_song::create_download_staging_dir(download_root)?;
+    let lock = tasks::download_song::lock_new_kvui_staging_directory(&staging)?;
+
+    let options = tasks::download_song::DownloadOptions {
+        count_in,
+        transpose,
+        selected_tracks: Some(selected_tracks),
+        force_restart: false,
+    };
+
+    let result = tasks::download_song::download_song_http_stateless_with_hook(
+        song_url,
+        options,
+        Some(staging.to_string_lossy().into_owned()),
+        &domain,
+        &mut |track, staged_file| {
+            let outcome = tasks::download_song::publish_single_staged_track(
+                staged_file,
+                song_destination,
+                track,
+                transpose,
+                policy,
+            )?;
+            let filename = staged_file.file_name()
+                .ok_or_else(|| anyhow!("Accepted stem has no filename"))?;
+            let retained_path = song_destination.join(filename);
+            if !retained_path.is_file() {
+                return Err(anyhow!("Published stem is not available: {}", retained_path.display()));
+            }
+            tracing::info!("Published '{}' ({:?})", track, outcome);
+            let _ = published.send(track.to_string());
+            Ok(retained_path)
+        },
+    );
+
+    // The original, safely published files are never removed by staging cleanup.
+    drop(lock);
+    if let Err(err) = fs::remove_dir_all(&staging) {
+        tracing::warn!("Could not remove temporary staging {}: {}", staging.display(), err);
+        if result.is_ok() {
+            return Err(err.into());
+        }
+    }
+    result
 }
 
 /// C23: Publish accepted HTTP stems as each download completes.
@@ -2626,21 +2689,52 @@ fn update_download_state(app: &mut App) {
         }
     }
 
+    // Log parsing is informational; only actual publication events certify
+    // a completed HTTP stem. Apply these *after* parsing so they stay Done.
+    if let Some(receiver) = download.published_rx.as_ref() {
+        for published_name in receiver.try_iter() {
+            let requested_name = normalize_track_name(&published_name);
+            if let Some(track) = download.tracks.iter_mut().find(|track| {
+                normalize_track_name(&track.name).eq_ignore_ascii_case(&requested_name)
+            }) {
+                track.status = TrackStatus::Done;
+            }
+        }
+    }
+
     if let Some(handle) = download.handle.as_ref() {
         if handle.is_finished() {
             let result = download.handle.take().unwrap().join();
             match result {
                 Ok(Ok(())) => {
-                    for track in &mut download.tracks {
-                        if track.status == TrackStatus::Pending
-                            || track.status == TrackStatus::Downloading
-                        {
-                            track.status = TrackStatus::Done;
+                    if download.published_rx.is_some() {
+                        // Every selected HTTP stem must have a publication event.
+                        let missing = download.tracks.iter()
+                            .filter(|track| track.status != TrackStatus::Done)
+                            .map(|track| track.name.clone())
+                            .collect::<Vec<_>>();
+                        if !missing.is_empty() {
+                            download.done = Some(Err(format!(
+                                "HTTP worker finished without publishing: {}", missing.join(", ")
+                            )));
+                            app.status = "Download finished with unverified tracks".to_string();
+                        } else {
+                            download.done = Some(Ok(()));
+                            app.status = "Download complete".to_string();
                         }
+                    } else {
+                        // Browser path retains its existing completion handling.
+                        for track in &mut download.tracks {
+                            if track.status == TrackStatus::Pending
+                                || track.status == TrackStatus::Downloading
+                            {
+                                track.status = TrackStatus::Done;
+                            }
+                        }
+                        download.done = Some(Ok(()));
+                        app.status = "Download complete".to_string();
                     }
-                    download.done = Some(Ok(()));
                     download.duration = Some(download.started_at.elapsed());
-                    app.status = "Download complete".to_string();
                     app.done_menu_index = 0;
                     app.screen = Screen::DownloadDone;
                 }
@@ -2817,6 +2911,8 @@ struct DownloadState {
     transpose: i8,
     tracks: Vec<TrackStatusItem>,
     handle: Option<JoinHandle<Result<()>>>,
+    // Per-run publications reported by the HTTP worker, independent of Resume.
+    published_rx: Option<std::sync::mpsc::Receiver<String>>,
     done: Option<Result<(), String>>,
     started_at: Instant,
     duration: Option<Duration>,
@@ -3132,7 +3228,7 @@ fn update_loading_state(app: &mut App) {
                     app.base_key = details.base_key;
                     app.detail_focus = DetailFocus::Tracks;
                     app.screen = Screen::SongDetail;
-                    c23_offer_saved_selection(app, &song);
+                    // Saved Resume selections are intentionally not offered.
                 }
                 (LoadingKind::Tracks { .. }, LoadingResult::Tracks(Err(err))) => {
                     app.status = format!("Failed to load tracks: {}", err);
@@ -4058,8 +4154,7 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                 return Ok(false);
             }
 
-            let resume = is_download_confirm && resume_available && confirm.selected == 2;
-            // Resume replaces only missing or invalid tracks selected by C23 planning.
+            // Phase 2C uses only fresh requests; Resume is never dispatched.
             let file_policy = if is_download_confirm {
                 Some(if confirm.selected == 0 {
                     tasks::download_song::ExistingFilePolicy::Keep
@@ -4113,28 +4208,8 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                                 return Ok(false);
                             }
                         };
-                        let c23_previously_verified = if use_browser {
-                            None
-                        } else if resume {
-                            match c23_verified_snapshot(
-                                &song.url, &song_destination,
-                                intro_click, key_shift, &selected_tracks,
-                            ) {
-                                Ok(Some(verified)) if verified.len() < selected_tracks.len() => {
-                                    Some(verified)
-                                }
-                                Ok(_) => {
-                                    app.status = "Resume is no longer available for this selection".to_string();
-                                    return Ok(false);
-                                }
-                                Err(err) => {
-                                    app.status = format!("Cannot verify Resume state: {err}");
-                                    return Ok(false);
-                                }
-                            }
-                        } else {
-                            Some(std::collections::HashSet::new())
-                        };
+                        // Phase 2C never reads C23 history for current-run results.
+                        let c23_previously_verified = None;
 
                         // UI log history must not mislabel tracks in a later attempt.
                         if let Ok(mut buffer) = app.logs.lock() {
@@ -4153,6 +4228,7 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                         let song_artist = song.artist.clone();
                         let song_title = song.title.clone();
                         let logs = app.logs.clone();
+                        let (published_tx, published_rx) = std::sync::mpsc::channel::<String>();
                         let worker_download_dir = download_dir.clone();
                         let worker_song_destination = song_destination.clone();
                         let handle = std::thread::spawn(move || {
@@ -4167,17 +4243,17 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                                     &worker_song_destination,
                                 )?;
 
-                                return run_c23_http_download(
+                                return run_stateless_http_download(
                                     &song_url,
                                     intro_click,
                                     key_shift,
                                     selected_tracks,
-                                    resume,
                                     &worker_download_dir,
                                     &worker_song_destination,
                                     file_policy.ok_or_else(|| {
                                         anyhow!("Missing download policy")
                                     })?,
+                                    published_tx,
                                 );
                             }
 
@@ -4239,6 +4315,7 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                             transpose: key_shift,
                             tracks: download_tracks,
                             handle: Some(handle),
+                            published_rx: if use_browser { None } else { Some(published_rx) },
                             done: None,
                             started_at: Instant::now(),
                             duration: None,
@@ -5760,7 +5837,7 @@ mod c23_completion_reporting_tests {
             tracks: names.iter().zip(statuses.iter()).map(|(name, status)| {
                 TrackStatusItem { name: (*name).into(), status: status.clone(), attempt: 0 }
             }).collect(),
-            handle: None, done: Some(Ok(())),
+            handle: None, published_rx: None, done: Some(Ok(())),
             started_at: Instant::now(), duration: None,
             download_dir: root.to_path_buf(),
             c23_previously_verified: Some(previously.iter().map(|s| s.to_lowercase()).collect()),
