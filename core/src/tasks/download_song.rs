@@ -891,6 +891,7 @@ fn download_song_http_internal(
                     &session.client,
                     &session.cookie_header,
                     domain,
+                    url,
                     &song_meta,
                     track_name,
                     level_index,
@@ -918,7 +919,7 @@ fn download_song_http_internal(
                 }
             };
             match result {
-                Ok((decoded, file_path, etag)) => {
+                Ok((decoded, file_path, etag, request_sha256)) => {
                     if http_etag_is_reused(&accepted_etags, etag.as_deref()) {
                         tracing::warn!(
                             "C22C-2 rejected '{}' because its server ETag matches a previously accepted instrument",
@@ -947,6 +948,13 @@ fn download_song_http_internal(
                     }
 
                     tracing::info!("Downloaded '{}'", decoded);
+                    // The staged file may be moved by the publication hook.
+                    // Capture its verified content hash before invoking that hook.
+                    let staged_sha256 = if request_sha256.is_some() {
+                        Some(sha256_file(&file_path)?)
+                    } else {
+                        None
+                    };
 
                     // C23: Allow the caller to publish and checkpoint
                     // this accepted stem before continuing.
@@ -958,6 +966,21 @@ fn download_song_http_internal(
                             "Completed stem path is unavailable: {}",
                             retained_path.display()
                         ));
+                    }
+
+                    // This provenance is for future cache validation only, never
+                    // Resume or skipping. A record is written solely for bytes
+                    // actually retained by the publication hook. Failure to write
+                    // fails closed for later cache use, not this verified download.
+                    if let (Some(request), Some(staged_hash)) =
+                        (request_sha256.as_deref(), staged_sha256.as_deref())
+                    {
+                        if let Err(err) = record_published_mix(&retained_path, request, staged_hash) {
+                            tracing::warn!(
+                                "Could not record mix provenance for '{}': {}. Future stale responses will be rejected.",
+                                decoded, err
+                            );
+                        }
                     }
 
                     if let Some(progress) = progress.as_ref() {
@@ -1030,6 +1053,7 @@ fn download_http_track(
     client: &Client,
     cookie_header: &str,
     domain: &str,
+    song_url: &str,
     song_meta: &SongMeta,
     track_name: &str,
     level_index: usize,
@@ -1038,7 +1062,7 @@ fn download_http_track(
     download_dir: &std::path::Path,
     first_requested_at: SystemTime,
     cached_existing_dir: Option<&Path>,
-) -> Result<(String, PathBuf, Option<String>)> {
+) -> Result<(String, PathBuf, Option<String>, Option<String>)> {
     let trackslevels = song_meta.build_trackslevels_solo(level_index)?;
     if env::var("KV_HTTP_DEBUG").ok().as_deref() == Some("1") {
         tracing::info!(
@@ -1061,6 +1085,13 @@ fn download_http_track(
         ("prodid", song_meta.prod_id.to_string()),
         ("pitch", transpose.to_string()),
     ];
+    // Include the complete ordered server request, not just the MP3 filename.
+    // KVUI records only a hash, so bkac and other request values are not exposed.
+    let request_sha256 = if cached_existing_dir.is_some() {
+        Some(mix_request_sha256(song_url, &params)?)
+    } else {
+        None
+    };
 
     let basket_url = format!("https://{domain}/basket.php");
     tracing::info!("Requesting mix build for '{}'", track_name);
@@ -1104,8 +1135,9 @@ fn download_http_track(
         &file_path,
         first_requested_at,
         existing_copy.as_deref(),
+        request_sha256.as_deref(),
     )?;
-    Ok((decoded, file_path, etag))
+    Ok((decoded, file_path, etag, request_sha256))
 }
 
 fn files_are_identical(first: &std::path::Path, second: &std::path::Path) -> Result<bool> {
@@ -1969,43 +2001,252 @@ mod c22c2_freshness_tests {
         assert!(!http_etag_is_reused(&accepted, None));
     }
 }
-/// A server-cached MP3 is usable only when it is an exact copy of an
-/// already-existing, regular MP3 at the verified destination. This is not a
-/// substitute for detecting changed mixer options; KVUI must still test those
-/// separately before the new downloader is installed.
-fn cached_mp3_matches_existing(
-    staged: &Path,
-    existing: &Path,
-    server_modified: SystemTime,
-) -> Result<bool> {
-    let existing_meta = match std::fs::symlink_metadata(existing) {
+// These are independent per-stem provenance records, NOT Resume or progress
+// records. They are kept alongside MP3 files so moving a whole song folder
+// preserves the ability to validate future server-reused audio.
+const MIX_PROVENANCE_VERSION: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MixProvenance {
+    version: u32,
+    filename: String,
+    request_sha256: String,
+    audio_sha256: String,
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut input = std::fs::File::open(path)?;
+    let mut sha = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        sha.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", sha.finalize()))
+}
+
+fn mix_request_sha256(song_url: &str, params: &[(&str, String)]) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    // JSON preserves Vec order; parameters come from the exact basket request.
+    let serialized = serde_json::to_vec(&(MIX_PROVENANCE_VERSION, song_url, params))?;
+    Ok(format!("{:x}", Sha256::digest(&serialized)))
+}
+
+fn mix_provenance_path(audio_path: &Path) -> Result<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let name = audio_path.file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("Invalid MP3 filename for mix provenance"))?;
+    let parent = audio_path.parent()
+        .ok_or_else(|| anyhow!("MP3 path has no parent"))?;
+    Ok(parent.join(format!(".kvui-mix-{:x}.json", Sha256::digest(name.as_bytes()))))
+}
+
+fn safe_regular_file_meta(path: &Path) -> Result<Option<std::fs::Metadata>> {
+    let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
     };
-    if !existing_meta.file_type().is_file() || existing_meta.file_type().is_symlink() {
-        return Ok(false);
+    if !meta.file_type().is_file() || meta.file_type().is_symlink() {
+        return Ok(None);
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        if existing_meta.file_attributes() & 0x400 != 0 {
-            return Ok(false);
+        if meta.file_attributes() & 0x400 != 0 {
+            return Ok(None);
         }
     }
-    // A local copy cannot have been downloaded from a server file created
-    // after that local file's own modification time (allow 2s clock margin).
+    Ok(Some(meta))
+}
+
+/// A stale response must match *both* the prior bytes and the exact requested
+/// mix variant. Unknown, damaged, unsafe, or mismatching provenance fails closed.
+fn cached_mp3_matches_existing(
+    staged: &Path,
+    existing: &Path,
+    server_modified: SystemTime,
+    request_sha256: &str,
+) -> Result<bool> {
+    let Some(existing_meta) = safe_regular_file_meta(existing)? else {
+        return Ok(false);
+    };
     if existing_meta.modified()? + Duration::from_secs(2) < server_modified {
         return Ok(false);
     }
-    files_are_identical(existing, staged)
+    if !files_are_identical(existing, staged)? {
+        return Ok(false);
+    }
+    let provenance_path = mix_provenance_path(existing)?;
+    let Some(meta) = safe_regular_file_meta(&provenance_path)? else {
+        return Ok(false);
+    };
+    if meta.len() > 4096 {
+        return Ok(false);
+    }
+    let record: MixProvenance = match serde_json::from_slice(&std::fs::read(&provenance_path)?) {
+        Ok(record) => record,
+        Err(_) => return Ok(false),
+    };
+    let Some(filename) = existing.file_name().and_then(|name| name.to_str()) else {
+        return Ok(false);
+    };
+    if record.version != MIX_PROVENANCE_VERSION
+        || record.filename != filename
+        || record.request_sha256 != request_sha256
+    {
+        return Ok(false);
+    }
+    Ok(record.audio_sha256 == sha256_file(existing)?)
+}
+
+/// Save provenance only for an MP3 actually retained after verification and
+/// publication. An interrupted metadata replacement can only suppress later
+/// cache acceptance: it cannot make an unverified file pass the hash check.
+fn record_published_mix(audio: &Path, request_sha256: &str, expected_hash: &str) -> Result<()> {
+    if safe_regular_file_meta(audio)?.is_none() {
+        return Err(anyhow!("Published MP3 is missing or is not a regular file"));
+    }
+    if sha256_file(audio)? != expected_hash {
+        return Err(anyhow!("Published file differs from verified staged MP3"));
+    }
+    let name = audio.file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("Invalid published MP3 name"))?;
+    let target = mix_provenance_path(audio)?;
+    let payload = serde_json::to_vec(&MixProvenance {
+        version: MIX_PROVENANCE_VERSION,
+        filename: name.to_string(),
+        request_sha256: request_sha256.to_string(),
+        audio_sha256: expected_hash.to_string(),
+    })?;
+
+    // Create a unique sibling first, rather than ever truncating the previous
+    // complete record. Move the previous record to a recoverable backup on
+    // Windows, which cannot reliably rename over a destination file.
+    let stamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos();
+    let parent = target.parent().ok_or_else(|| anyhow!("Missing provenance parent"))?;
+    let mut temp = None;
+    for attempt in 0..32 {
+        let candidate = parent.join(format!(
+            ".kvui-mix-write-{}-{stamp}-{attempt}.tmp", std::process::id()
+        ));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(mut output) => {
+                let written = (|| -> Result<()> {
+                    output.write_all(&payload)?;
+                    output.sync_all()?;
+                    Ok(())
+                })();
+                drop(output);
+                if let Err(err) = written {
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err(err);
+                }
+                temp = Some(candidate);
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let temp = temp.ok_or_else(|| anyhow!("Cannot reserve mix provenance temp file"))?;
+    let result = (|| -> Result<()> {
+        match std::fs::symlink_metadata(&target) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::rename(&temp, &target)?;
+            }
+            Err(err) => return Err(err.into()),
+            Ok(_) => {
+                if safe_regular_file_meta(&target)?.is_none() {
+                    return Err(anyhow!("Unsafe existing mix provenance record"));
+                }
+                let backup = parent.join(format!(
+                    ".kvui-mix-backup-{}-{stamp}.json", std::process::id()
+                ));
+                if std::fs::symlink_metadata(&backup).is_ok() {
+                    return Err(anyhow!("Mix provenance backup already exists"));
+                }
+                std::fs::rename(&target, &backup)?;
+                if let Err(err) = std::fs::rename(&temp, &target) {
+                    if let Err(restore) = std::fs::rename(&backup, &target) {
+                        return Err(anyhow!(
+                            "Provenance update failed: {err}; old record preserved at {} but restore failed: {restore}",
+                            backup.display()
+                        ));
+                    }
+                    return Err(anyhow!("Provenance update failed; original record restored: {err}"));
+                }
+                if let Err(err) = std::fs::remove_file(&backup) {
+                    tracing::warn!("Retained previous mix metadata backup {}: {}", backup.display(), err);
+                }
+            }
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 #[cfg(test)]
 mod cached_mp3_tests {
-    use super::cached_mp3_matches_existing;
+    use super::{cached_mp3_matches_existing, mix_provenance_path, record_published_mix, sha256_file, mix_request_sha256};
     use std::fs;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn unproven_stale_cached_mp3_must_not_pass() {
+        // An old Intro Click OFF file must not authorize an ON request
+        // unless its original mix configuration can be verified.
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let root = std::env::temp_dir().join(format!(
+            "kvui-variant-safety-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        fs::create_dir_all(&root).unwrap();
+
+        let existing = root.join("Bass.mp3");
+        let staged = root.join("staged.mp3");
+
+        fs::write(&existing, b"previous Intro Click OFF mix").unwrap();
+        fs::write(&staged, b"previous Intro Click OFF mix").unwrap();
+
+        let old_modified = fs::metadata(&existing)
+            .unwrap()
+            .modified()
+            .unwrap() - Duration::from_secs(5);
+
+        // No provenance exists to establish that this old file matches
+        // the newly requested settings.
+        let accepted = cached_mp3_matches_existing(
+            &staged,
+            &existing,
+            old_modified,
+            "request-intro-click-on"
+        ).unwrap();
+
+        fs::remove_dir_all(&root).unwrap();
+
+        assert!(
+            !accepted,
+            "Unproven stale MP3 was incorrectly accepted"
+        );
+    }
 
     #[test]
     fn only_accepts_a_byte_identical_existing_regular_file() {
@@ -2020,12 +2261,86 @@ mod cached_mp3_tests {
         fs::write(&staged, b"previously accepted bass MP3").unwrap();
         let server_modified = fs::metadata(&existing).unwrap().modified().unwrap()
             - Duration::from_secs(5);
-        assert!(cached_mp3_matches_existing(&staged, &existing, server_modified).unwrap());
+        let hash = sha256_file(&existing).unwrap();
+        record_published_mix(&existing, "request-intro-click-off", &hash).unwrap();
+        assert!(cached_mp3_matches_existing(&staged, &existing, server_modified, "request-intro-click-off").unwrap());
         fs::write(&staged, b"different audio -- possibly wrong instrument").unwrap();
-        assert!(!cached_mp3_matches_existing(&staged, &existing, server_modified).unwrap());
+        assert!(!cached_mp3_matches_existing(&staged, &existing, server_modified, "request-intro-click-off").unwrap());
         fs::remove_file(&existing).unwrap();
-        assert!(!cached_mp3_matches_existing(&staged, &existing, server_modified).unwrap());
+        assert!(!cached_mp3_matches_existing(&staged, &existing, server_modified, "request-intro-click-off").unwrap());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_intro_click_is_rejected_even_when_audio_bytes_match() {
+        let root = std::env::temp_dir().join(format!(
+            "kvui-mix-changed-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let old = root.join("Bass.mp3");
+        let staged = root.join("staged.mp3");
+        fs::write(&old, b"off audio").unwrap();
+        fs::write(&staged, b"off audio").unwrap();
+        let hash = sha256_file(&old).unwrap();
+        record_published_mix(&old, "request-off", &hash).unwrap();
+        let server_time = fs::metadata(&old).unwrap().modified().unwrap() - Duration::from_secs(5);
+        assert!(cached_mp3_matches_existing(&staged, &old, server_time, "request-off").unwrap());
+        assert!(!cached_mp3_matches_existing(&staged, &old, server_time, "request-on").unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupted_or_mismatched_provenance_fails_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "kvui-mix-corrupt-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let old = root.join("Bass.mp3");
+        let staged = root.join("staged.mp3");
+        fs::write(&old, b"original").unwrap();
+        fs::write(&staged, b"original").unwrap();
+        let hash = sha256_file(&old).unwrap();
+        record_published_mix(&old, "requested", &hash).unwrap();
+        let server_time = fs::metadata(&old).unwrap().modified().unwrap() - Duration::from_secs(5);
+        fs::write(mix_provenance_path(&old).unwrap(), b"invalid-json").unwrap();
+        assert!(!cached_mp3_matches_existing(&staged, &old, server_time, "requested").unwrap());
+        record_published_mix(&old, "requested", &hash).unwrap();
+        fs::write(&old, b"edited audio").unwrap();
+        fs::write(&staged, b"edited audio").unwrap();
+        assert!(!cached_mp3_matches_existing(&staged, &old, server_time, "requested").unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provenance_write_rejects_a_different_published_file() {
+        let root = std::env::temp_dir().join(format!(
+            "kvui-mix-kept-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let old = root.join("Bass.mp3");
+        fs::write(&old, b"user-kept-audio").unwrap();
+        assert!(record_published_mix(&old, "new-request", "not-the-published-hash").is_err());
+        assert!(!mix_provenance_path(&old).unwrap().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn request_hash_tracks_all_mix_parameters_and_song_identity() {
+        let mut params = vec![("precount", "0".to_string()), ("pitch", "0".to_string()),
+            ("trackslevels", "0,100,0".to_string()), ("pannings", "0,0".to_string()),
+            ("bkac", "token".to_string())];
+        let old = mix_request_sha256("https://example.test/song1", &params).unwrap();
+        assert_eq!(old, mix_request_sha256("https://example.test/song1", &params).unwrap());
+        assert_ne!(old, mix_request_sha256("https://example.test/song2", &params).unwrap());
+        for index in 0..params.len() {
+            let prior = params[index].1.clone();
+            params[index].1.push('X');
+            assert_ne!(old, mix_request_sha256("https://example.test/song1", &params).unwrap());
+            params[index].1 = prior;
+        }
     }
 
     #[test]
@@ -2041,7 +2356,7 @@ mod cached_mp3_tests {
         fs::write(&staged, b"same bytes").unwrap();
         let server_modified = fs::metadata(&existing).unwrap().modified().unwrap()
             + Duration::from_secs(60);
-        assert!(!cached_mp3_matches_existing(&staged, &existing, server_modified).unwrap());
+        assert!(!cached_mp3_matches_existing(&staged, &existing, server_modified, "request-intro-click-off").unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 }
@@ -2052,6 +2367,7 @@ fn download_file(
     path: &PathBuf,
     first_requested_at: SystemTime,
     cached_existing: Option<&Path>,
+    request_sha256: Option<&str>,
 ) -> Result<Option<String>> {
     let response_started = std::time::Instant::now();
     let mut resp = client.get(url).send()?;
@@ -2124,17 +2440,19 @@ fn download_file(
     drop(file);
     if !is_fresh {
         let existing = cached_existing.expect("checked before downloading");
-        if !cached_mp3_matches_existing(path, existing, modified_at)? {
+        if !request_sha256.is_some_and(|request| {
+            cached_mp3_matches_existing(path, existing, modified_at, request).unwrap_or(false)
+        }) {
             let _ = std::fs::remove_file(path);
             tracing::warn!(
-                "C22C-2 rejected stale MP3: body differs from existing verified song/track file"
+                "C22C-2 rejected stale MP3: body or saved mix configuration cannot be verified"
             );
             return Err(anyhow!(
-                "C22C-2 server file is stale and differs from the existing track"
+                "C22C-2 server file is stale or mix provenance is missing/mismatched"
             ));
         }
         tracing::info!(
-            "C22C-2 accepted server-reused MP3: byte-identical to existing song/track file"
+            "C22C-2 accepted server-reused MP3: identical audio and verified mix provenance"
         );
     }
     Ok(accepted_etag)
