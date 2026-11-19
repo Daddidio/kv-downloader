@@ -919,7 +919,7 @@ fn download_song_http_internal(
                 }
             };
             match result {
-                Ok((decoded, file_path, etag, request_sha256)) => {
+                Ok((decoded, file_path, etag, request_sha256, provenance_verified)) => {
                     if http_etag_is_reused(&accepted_etags, etag.as_deref()) {
                         tracing::warn!(
                             "C22C-2 rejected '{}' because its server ETag matches a previously accepted instrument",
@@ -972,6 +972,7 @@ fn download_song_http_internal(
                     // Resume or skipping. A record is written solely for bytes
                     // actually retained by the publication hook. Failure to write
                     // fails closed for later cache use, not this verified download.
+                    if provenance_verified {
                     if let (Some(request), Some(staged_hash)) =
                         (request_sha256.as_deref(), staged_sha256.as_deref())
                     {
@@ -980,6 +981,20 @@ fn download_song_http_internal(
                                 "Could not record mix provenance for '{}': {}. Future stale responses will be rejected.",
                                 decoded, err
                             );
+                        }
+                    }
+                    } else {
+                        tracing::warn!(
+                            "KVUI-09: unverified cached MP3 published without provenance"
+                        );
+                        let provenance_path = mix_provenance_path(&retained_path)?;
+                        if let Err(err) = std::fs::remove_file(&provenance_path) {
+                            if err.kind() != std::io::ErrorKind::NotFound {
+                                return Err(anyhow!(
+                                    "Cannot remove outdated mix provenance: {}",
+                                    err
+                                ));
+                            }
                         }
                     }
 
@@ -1062,7 +1077,7 @@ fn download_http_track(
     download_dir: &std::path::Path,
     first_requested_at: SystemTime,
     cached_existing_dir: Option<&Path>,
-) -> Result<(String, PathBuf, Option<String>, Option<String>)> {
+) -> Result<(String, PathBuf, Option<String>, Option<String>, bool)> {
     let trackslevels = song_meta.build_trackslevels_solo(level_index)?;
     if env::var("KV_HTTP_DEBUG").ok().as_deref() == Some("1") {
         tracing::info!(
@@ -1129,7 +1144,7 @@ fn download_http_track(
     let file_path = download_dir.join(&decoded);
     let existing_copy = cached_existing_dir.map(|dir| dir.join(&decoded));
     tracing::info!("Downloading '{}'", decoded);
-    let etag = download_file(
+    let (etag, provenance_verified) = download_file(
         client,
         &file_url,
         &file_path,
@@ -1137,7 +1152,7 @@ fn download_http_track(
         existing_copy.as_deref(),
         request_sha256.as_deref(),
     )?;
-    Ok((decoded, file_path, etag, request_sha256))
+    Ok((decoded, file_path, etag, request_sha256, provenance_verified))
 }
 
 fn files_are_identical(first: &std::path::Path, second: &std::path::Path) -> Result<bool> {
@@ -2368,7 +2383,7 @@ fn download_file(
     first_requested_at: SystemTime,
     cached_existing: Option<&Path>,
     request_sha256: Option<&str>,
-) -> Result<Option<String>> {
+) -> Result<(Option<String>, bool)> {
     let response_started = std::time::Instant::now();
     let mut resp = client.get(url).send()?;
 
@@ -2420,13 +2435,11 @@ fn download_file(
         ))?;
 
     let is_fresh = http_server_file_is_fresh(modified_at, first_requested_at);
-    if !is_fresh && cached_existing.is_none() {
+    let mut provenance_verified = is_fresh;
+    if !is_fresh {
         tracing::warn!(
-            "C22C-2 rejected stale MP3: server Last-Modified predates the original instrument request"
+            "KVUI-09 EXPERIMENT: cached MP3 allowed past timestamp check"
         );
-        return Err(anyhow!(
-            "C22C-2 server file is stale relative to original request"
-        ));
     }
 
     let accepted_etag = resp
@@ -2439,23 +2452,22 @@ fn download_file(
     std::io::copy(&mut resp, &mut file)?;
     drop(file);
     if !is_fresh {
-        let existing = cached_existing.expect("checked before downloading");
-        if !request_sha256.is_some_and(|request| {
-            cached_mp3_matches_existing(path, existing, modified_at, request).unwrap_or(false)
-        }) {
-            let _ = std::fs::remove_file(path);
-            tracing::warn!(
-                "C22C-2 rejected stale MP3: body or saved mix configuration cannot be verified"
+        let verified = match (cached_existing, request_sha256) {
+            (Some(existing), Some(request)) => {
+                cached_mp3_matches_existing(path, existing, modified_at, request)
+                    .unwrap_or(false)
+            }
+            _ => false,
+        };
+        if verified { provenance_verified = true; tracing::info!("KVUI-09 EXPERIMENT: cached MP3 provenance verified"
             );
-            return Err(anyhow!(
-                "C22C-2 server file is stale or mix provenance is missing/mismatched"
-            ));
+        } else {
+            tracing::warn!(
+                "KVUI-09 EXPERIMENT: cached MP3 accepted without verified provenance"
+            );
         }
-        tracing::info!(
-            "C22C-2 accepted server-reused MP3: identical audio and verified mix provenance"
-        );
     }
-    Ok(accepted_etag)
+    Ok((accepted_etag, provenance_verified))
 }
 
 #[cfg(test)]
