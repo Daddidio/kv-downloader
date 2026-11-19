@@ -372,8 +372,6 @@ fn configure_demo_screen(app: &mut App, screen: DemoScreen) {
             let complete = matches!(screen, DemoScreen::Complete);
             app.download = Some(DownloadState {
                 song,
-                count_in: false,
-                transpose: 0,
                 tracks,
                 handle: None,
                 published_rx: None,
@@ -2282,8 +2280,6 @@ struct TrackStatusItem {
 
 struct DownloadState {
     song: Song,
-    count_in: bool,
-    transpose: i8,
     tracks: Vec<TrackStatusItem>,
     handle: Option<JoinHandle<Result<()>>>,
     // Per-run publications reported by the HTTP worker, independent of Resume.
@@ -3435,8 +3431,6 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
             });
             app.download = Some(DownloadState {
                 song,
-                count_in: intro_click,
-                transpose: key_shift,
                 tracks: download_tracks,
                 handle: Some(handle),
                 published_rx: Some(published_rx),
