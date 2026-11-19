@@ -102,7 +102,6 @@ struct App {
     tracks_state: ListState,
     detail_focus: DetailFocus,
     intro_click: bool,
-    use_browser: bool,
     key_shift: i8,
     base_key: Option<String>,
     status: String,
@@ -143,7 +142,6 @@ impl App {
             tracks_state: ListState::default(),
             detail_focus: DetailFocus::Tracks,
             intro_click: false,
-            use_browser: false,
             key_shift: 0,
             base_key: None,
             status: String::new(),
@@ -871,9 +869,6 @@ fn handle_detail_keys(
         KeyCode::Char('i') => {
             app.intro_click = !app.intro_click;
         }
-        KeyCode::Char('b') => {
-            app.use_browser = !app.use_browser;
-        }
         KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Right => {
             if app.key_shift < 4 {
                 app.key_shift += 1;
@@ -899,25 +894,15 @@ fn handle_detail_keys(
                         return Ok(false);
                     }
                     app.confirm = Some(ConfirmState {
-                        message: if app.use_browser {
-                            vec![
-                                "This will open a visible Chromium browser.".to_string(),
-                                "Do not interact with the browser during downloading.".to_string(),
-                                "Selected stems will safely replace existing files.".to_string(),
-                                "Choose Download Process".to_string(),
-                            ]
-                        } else {
-                            vec![
-                                "This will use the verified HTTP downloader.".to_string(),
-                                "Selected stems will safely replace existing files.".to_string(),
-                                "Choose Download Process".to_string(),
-                            ]
-                        },
+                        message: vec![
+                            "This will use the verified HTTP downloader.".to_string(),
+                            "Selected stems will safely replace existing files.".to_string(),
+                            "Choose Download Process".to_string(),
+                        ],
                         selected: 0,
                         payload: ConfirmPayload::StartDownload {
                             song,
                             selected_tracks,
-                            use_browser: app.use_browser,
                             intro_click: app.intro_click,
                             key_shift: app.key_shift,
                         },
@@ -1281,9 +1266,9 @@ fn render_detail(frame: &mut ratatui::Frame, app: &mut App) {
             Span::styled("Key: ", normal_text_style()),
             Span::raw(key_display),
             Span::raw("   Method: "),
-            Span::raw(if app.use_browser { "Chromium" } else { "HTTP" }),
+            Span::raw("HTTP"),
         ]),
-        Line::from("i: Intro Click   b: Chromium/HTTP   +/-: Key"),
+        Line::from("i: Intro Click   +/-: Key"),
         Line::from(vec![
             Span::styled(
                 "Download folder: ",
@@ -1641,66 +1626,6 @@ fn login_flow() -> Result<()> {
     Ok(())
 }
 
-fn start_download(
-    song_url: &str,
-    use_browser: bool,
-    count_in: bool,
-    transpose: i8,
-    selected_tracks: Vec<String>,
-    download_dir: &Path,
-) -> Result<()> {
-    let domain = extract_domain_from_url(song_url)
-        .ok_or_else(|| anyhow!("Missing domain from url"))?;
-    let download_options = tasks::download_song::DownloadOptions {
-        count_in,
-        transpose,
-        selected_tracks: if selected_tracks.is_empty() {
-            None
-        } else {
-            Some(selected_tracks)
-        },
-        force_restart: false,
-    };
-    if use_browser {
-        tracing::info!("Using Chromium browser automation (headless: false)");
-
-        let config = driver::Config {
-            domain,
-            headless: false,
-            download_path: Some(download_dir.to_string_lossy().trim_start_matches(r"\\?\").to_owned()),
-            idle_browser_timeout: Duration::from_secs(300),
-            profile_dir: driver::default_profile_dir(),
-        };
-
-        let driver = driver::Driver::new(config);
-
-        let credentials = match (
-            std::env::var("KV_USERNAME"),
-            std::env::var("KV_PASSWORD"),
-        ) {
-            (Ok(user), Ok(password)) => keystore::Credentials { user, password },
-            _ => keystore::Keystore::get_credentials().map_err(|e| {
-                anyhow!("Browser authentication requires saved credentials: {}", e)
-            })?,
-        };
-
-        driver.sign_in(&credentials.user, &credentials.password)?;
-        driver.download_song(song_url, download_options)?;
-
-        // Match the tested CLI's post-download browser grace period.
-        std::thread::sleep(Duration::from_secs(10));
-    } else {
-        tracing::info!("Using HTTP downloader");
-        tasks::download_song::download_song_http(
-            song_url,
-            download_options,
-            Some(download_dir.to_string_lossy().into_owned()),
-            &domain,
-        )?;
-    }
-    Ok(())
-}
-
 /// Remove abandoned temporary staging folders using the existing lock-aware
 /// cleanup. Active and unmarked legacy folders are left untouched.
 fn cleanup_abandoned_staging(download_root: &Path) -> Result<()> {
@@ -1716,66 +1641,6 @@ fn cleanup_abandoned_staging(download_root: &Path) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
-struct PreparedDownload {
-    staging_dir: PathBuf,
-    files: Vec<PathBuf>,
-    lock_file: File,
-}
-
-/// Prepare and verify downloads without changing destination files.
-#[allow(dead_code)]
-fn prepare_staged_download(
-    song_url: &str,
-    use_browser: bool,
-    count_in: bool,
-    transpose: i8,
-    selected_tracks: Vec<String>,
-    destination_dir: &Path,
-) -> Result<PreparedDownload> {
-    cleanup_abandoned_staging(destination_dir)?;
-    let staging_dir =
-        tasks::download_song::create_download_staging_dir(destination_dir)?;
-
-    let lock_file =
-        tasks::download_song::lock_new_kvui_staging_directory(&staging_dir)?;
-
-    let result = (|| -> Result<Vec<PathBuf>> {
-        kv_core::download_progress::DownloadProgress::new()
-            .start_fresh_download(song_url, count_in, transpose)?;
-
-        start_download(
-            song_url,
-            use_browser,
-            count_in,
-            transpose,
-            selected_tracks.clone(),
-            &staging_dir,
-        )?;
-
-        tasks::download_song::verify_staged_tracks_for_key(
-            &staging_dir,
-            &selected_tracks,
-            transpose,
-        )
-    })();
-
-    match result {
-        Ok(files) => Ok(PreparedDownload {
-            staging_dir,
-            files,
-            lock_file,
-        }),
-        Err(err) => {
-            tracing::warn!(
-                "Incomplete download retained in {}: {}",
-                staging_dir.display(),
-                err
-            );
-            Err(err)
-        }
-    }
-}
 /// Phase 2C: download every selected HTTP stem without consulting either
 /// historical progress tracker or C23 Resume. Each accepted stem is checked
 /// against the requested name and key before independent safe publication.
@@ -2461,7 +2326,6 @@ enum ConfirmPayload {
     StartDownload {
         song: Song,
         selected_tracks: Vec<String>,
-        use_browser: bool,
         intro_click: bool,
         key_shift: i8,
     },
@@ -3095,7 +2959,6 @@ mod c24_download_confirm_layout_tests {
                     first_seen: 0, purchase_date: 0,
                 },
                 selected_tracks: vec!["Bass".into()],
-                use_browser: false,
                 intro_click: false,
                 key_shift: 0,
             },
@@ -3496,7 +3359,6 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
             let ConfirmPayload::StartDownload {
                 song,
                 selected_tracks,
-                use_browser,
                 intro_click,
                 key_shift,
             } = confirm.payload;
@@ -3551,37 +3413,6 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
             let worker_song_destination = song_destination.clone();
             let handle = std::thread::spawn(move || {
                 let _guard = LogScope::new(logs);
-                if !use_browser {
-                    kvui_prepare_keyed_song_destination(
-                        &worker_download_dir,
-                        &song_artist,
-                        &song_title,
-                        &song_url,
-                        key_shift,
-                        &worker_song_destination,
-                    )?;
-
-                    return run_stateless_http_download(
-                        &song_url,
-                        intro_click,
-                        key_shift,
-                        selected_tracks,
-                        &worker_download_dir,
-                        &worker_song_destination,
-                        file_policy,
-                        published_tx,
-                    );
-                }
-
-                let prepared = prepare_staged_download(
-                    &song_url,
-                    use_browser,
-                    intro_click,
-                    key_shift,
-                    selected_tracks,
-                    &worker_download_dir,
-                )?;
-
                 kvui_prepare_keyed_song_destination(
                     &worker_download_dir,
                     &song_artist,
@@ -3590,40 +3421,17 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                     key_shift,
                     &worker_song_destination,
                 )?;
-                let mut created = 0usize;
-                let mut replaced = 0usize;
-                let mut kept = 0usize;
 
-                for staged in &prepared.files {
-                    let outcome = tasks::download_song::publish_staged_file(
-                        staged,
-                        &worker_song_destination,
-                        file_policy,
-                    )?;
-
-                    match outcome {
-                        tasks::download_song::PublishOutcome::Created => {
-                            created += 1;
-                        }
-                        tasks::download_song::PublishOutcome::Replaced => {
-                            replaced += 1;
-                        }
-                        tasks::download_song::PublishOutcome::KeptExisting => {
-                            kept += 1;
-                        }
-                    }
-                }
-
-                // Release the active lock before deleting its file.
-                drop(prepared.lock_file);
-                fs::remove_dir_all(&prepared.staging_dir)?;
-
-                tracing::info!(
-                    "Protected download: {} new, {} replaced, {} kept",
-                    created, replaced, kept
-                );
-
-                Ok(())
+                run_stateless_http_download(
+                    &song_url,
+                    intro_click,
+                    key_shift,
+                    selected_tracks,
+                    &worker_download_dir,
+                    &worker_song_destination,
+                    file_policy,
+                    published_tx,
+                )
             });
             app.download = Some(DownloadState {
                 song,
@@ -3631,7 +3439,7 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                 transpose: key_shift,
                 tracks: download_tracks,
                 handle: Some(handle),
-                published_rx: if use_browser { None } else { Some(published_rx) },
+                published_rx: Some(published_rx),
                 done: None,
                 started_at: Instant::now(),
                 duration: None,
