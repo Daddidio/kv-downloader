@@ -4147,7 +4147,10 @@ mod artist_song_collision_tests {
     };
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
     fn temporary_root() -> PathBuf {
         let stamp = SystemTime::now()
@@ -4155,8 +4158,10 @@ mod artist_song_collision_tests {
             .unwrap()
             .as_nanos();
 
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+
         let root = std::env::temp_dir().join(format!(
-            "kvui-collision-test-{}-{stamp}",
+            "kvui-collision-test-{}-{stamp}-{id}",
             std::process::id()
         ));
 
