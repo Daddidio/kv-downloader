@@ -1,5 +1,37 @@
 # Changelog
 
+## KVUI development — Unreleased
+
+This section documents development in the Daddidio fork. It is not an official upstream release.
+
+### User interface
+
+- Added KVUI, a terminal-based interface for browsing and downloading purchased Karaoke Version tracks.
+- Added a local song catalog with refresh capability.
+- Added Title A–Z and Artist A–Z sorting.
+- Improved keyboard navigation, track selection, confirmation screens, and download status reporting.
+- Added detection and safe cleanup of abandoned download staging folders.
+
+### Download workflow
+
+- Simplified KVUI to use direct HTTP downloading.
+- Retired Chromium-based audio downloading from KVUI while retaining Chromium for authentication and website security challenges.
+- Removed the former saved-progress resume workflow from KVUI.
+- Added staging and publication safeguards to protect previously downloaded files.
+- Added validation of downloaded tracks, filenames, and requested transposition.
+- Added cached-MP3 provenance checks to prevent acceptance of unverified stale audio.
+- Preserved the existing artist/song download directory organization.
+
+### Compatibility and maintenance
+
+- Retained the legacy command-line downloader, including its original Chromium-related options.
+- Added automated tests covering downloads, file safety, staging, recovery, and user-interface behavior.
+- Updated README documentation to distinguish KVUI from the legacy CLI.
+
+**Release status:** Development branch; no GitHub release published.
+
+---
+
 ## 0.5.0
 
 - Reuse a persistent Chrome profile so Fastly's bot-challenge clearance survives between runs

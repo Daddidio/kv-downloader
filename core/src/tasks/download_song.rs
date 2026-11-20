@@ -388,7 +388,7 @@ impl Driver {
         // Extract filename from the URL
         let filename = href
             .split('/')
-            .last()
+            .next_back()
             .ok_or_else(|| anyhow!("Could not extract filename from URL"))?
             .to_string();
 
@@ -675,15 +675,14 @@ impl Driver {
 
     #[allow(dead_code)]
     fn record_screencast(&self, tab: &Tab) -> Result<()> {
-        tab.add_event_listener(Arc::new(|event: &Event| match event {
-            Event::PageScreencastFrame(frame_event) => {
+        tab.add_event_listener(Arc::new(|event: &Event| {
+            if let Event::PageScreencastFrame(frame_event) = event {
                 let bytes = BASE64_STANDARD
                     .decode(frame_event.params.data.clone())
                     .unwrap();
                 let ts = frame_event.params.metadata.timestamp.unwrap();
                 std::fs::write(format!("screencast-{}.jpg", ts), &bytes).unwrap();
             }
-            _ => {}
         }))?;
 
         tab.start_screencast(
@@ -891,15 +890,17 @@ fn download_song_http_internal(
                     &session.client,
                     &session.cookie_header,
                     domain,
-                    url,
                     &song_meta,
-                    track_name,
-                    level_index,
-                    options.count_in,
-                    options.transpose,
-                    &download_dir,
-                    first_requested_at,
-                    cached_existing_dir,
+                    HttpTrackRequest {
+                        song_url: url,
+                        track_name,
+                        level_index,
+                        count_in: options.count_in,
+                        transpose: options.transpose,
+                        download_dir: &download_dir,
+                        first_requested_at,
+                        cached_existing_dir,
+                    },
                 ) {
                     Err(err) if err.downcast_ref::<ChallengeError>().is_some() => {
                         challenge_refreshes += 1;
@@ -919,7 +920,13 @@ fn download_song_http_internal(
                 }
             };
             match result {
-                Ok((decoded, file_path, etag, request_sha256, provenance_verified)) => {
+                Ok(HttpTrackResult {
+                    decoded,
+                    file_path,
+                    etag,
+                    request_sha256,
+                    provenance_verified,
+                }) => {
                     if http_etag_is_reused(&accepted_etags, etag.as_deref()) {
                         tracing::warn!(
                             "C22C-2 rejected '{}' because its server ETag matches a previously accepted instrument",
@@ -1064,20 +1071,42 @@ fn download_song_http_internal(
     }
 }
 
+struct HttpTrackRequest<'a> {
+    song_url: &'a str,
+    track_name: &'a str,
+    level_index: usize,
+    count_in: bool,
+    transpose: i8,
+    download_dir: &'a Path,
+    first_requested_at: SystemTime,
+    cached_existing_dir: Option<&'a Path>,
+}
+
+struct HttpTrackResult {
+    decoded: String,
+    file_path: PathBuf,
+    etag: Option<String>,
+    request_sha256: Option<String>,
+    provenance_verified: bool,
+}
+
 fn download_http_track(
     client: &Client,
     cookie_header: &str,
     domain: &str,
-    song_url: &str,
     song_meta: &SongMeta,
-    track_name: &str,
-    level_index: usize,
-    count_in: bool,
-    transpose: i8,
-    download_dir: &std::path::Path,
-    first_requested_at: SystemTime,
-    cached_existing_dir: Option<&Path>,
-) -> Result<(String, PathBuf, Option<String>, Option<String>, bool)> {
+    request: HttpTrackRequest<'_>,
+) -> Result<HttpTrackResult> {
+    let HttpTrackRequest {
+        song_url,
+        track_name,
+        level_index,
+        count_in,
+        transpose,
+        download_dir,
+        first_requested_at,
+        cached_existing_dir,
+    } = request;
     let trackslevels = song_meta.build_trackslevels_solo(level_index)?;
     if env::var("KV_HTTP_DEBUG").ok().as_deref() == Some("1") {
         tracing::info!(
@@ -1132,7 +1161,7 @@ fn download_http_track(
     let file_url = poll_for_file_url(client, cookie_header, &begin_url, track_name, transpose)?;
     let filename = file_url
         .split('/')
-        .last()
+        .next_back()
         .ok_or_else(|| anyhow!("Missing filename in download url"))?;
     let decoded = urlencoding::decode(filename)
         .map_err(|e| anyhow!("Failed to decode filename: {}", e))?
@@ -1153,7 +1182,13 @@ fn download_http_track(
         existing_copy.as_deref(),
         request_sha256.as_deref(),
     )?;
-    Ok((decoded, file_path, etag, request_sha256, provenance_verified))
+    Ok(HttpTrackResult {
+        decoded,
+        file_path,
+        etag,
+        request_sha256,
+        provenance_verified,
+    })
 }
 
 fn files_are_identical(first: &std::path::Path, second: &std::path::Path) -> Result<bool> {
@@ -1667,7 +1702,7 @@ impl SongMeta {
     fn build_trackslevels_solo(&self, level_index: usize) -> Result<String> {
         let total = self.levels.len();
         let mut values = vec![0u32; total];
-        if let Some(existing) = self.levels.get(0) {
+        if let Some(existing) = self.levels.first() {
             values[0] = *existing;
         }
         if level_index == 0 || level_index > total {

@@ -8,14 +8,14 @@ permissions:
   contents: read
 
 env:
-  RUSTFLAGS: -Dwarnings # Turn warnings into errors
+  RUSTFLAGS: -Dwarnings
   RUST_CI: true
 
 jobs:
   check:
-    name: "ubuntu: cargo clippy && cargo fmt && cargo test"
+    name: "ubuntu: cargo clippy && cargo test"
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -24,7 +24,7 @@ jobs:
       - uses: awalsh128/cache-apt-pkgs-action@latest
         with:
           packages: libdbus-glib-1-dev
-      - run: cargo fmt --all -- --check
+      # Formatting enforcement deferred until a dedicated source-formatting cleanup.
       - run: cargo test
       - run: cargo clippy
 

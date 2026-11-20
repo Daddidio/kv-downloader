@@ -868,35 +868,33 @@ fn handle_detail_keys(
                 app.key_shift -= 1;
             }
         }
-        KeyCode::Enter => {
-            if app.detail_focus == DetailFocus::Download {
-                if let Some(song) = app.current_song.clone() {
-                    app.status = "Starting download...".to_string();
-                    let selected_tracks: Vec<String> = app
-                        .tracks
-                        .iter()
-                        .filter(|t| t.selected)
-                        .map(|t| t.name.clone())
-                        .collect();
-                    if selected_tracks.is_empty() {
-                        app.status = "Select at least one track to download".to_string();
-                        return Ok(false);
-                    }
-                    app.confirm = Some(ConfirmState {
-                        message: vec![
-                            "This will use the verified HTTP downloader.".to_string(),
-                            "Selected stems will safely replace existing files.".to_string(),
-                            "Choose Download Process".to_string(),
-                        ],
-                        selected: 0,
-                        payload: ConfirmPayload::StartDownload {
-                            song,
-                            selected_tracks,
-                            intro_click: app.intro_click,
-                            key_shift: app.key_shift,
-                        },
-                    });
+        KeyCode::Enter if app.detail_focus == DetailFocus::Download => {
+            if let Some(song) = app.current_song.clone() {
+                app.status = "Starting download...".to_string();
+                let selected_tracks: Vec<String> = app
+                    .tracks
+                    .iter()
+                    .filter(|t| t.selected)
+                    .map(|t| t.name.clone())
+                    .collect();
+                if selected_tracks.is_empty() {
+                    app.status = "Select at least one track to download".to_string();
+                    return Ok(false);
                 }
+                app.confirm = Some(ConfirmState {
+                    message: vec![
+                        "This will use the verified HTTP downloader.".to_string(),
+                        "Selected stems will safely replace existing files.".to_string(),
+                        "Choose Download Process".to_string(),
+                    ],
+                    selected: 0,
+                    payload: ConfirmPayload::StartDownload {
+                        song,
+                        selected_tracks,
+                        intro_click: app.intro_click,
+                        key_shift: app.key_shift,
+                    },
+                });
             }
         }
         _ => {}
@@ -1219,8 +1217,7 @@ fn song_list_items(songs: &[Song], sort: SongSort, total_width: usize) -> Vec<Li
         .unwrap_or(0);
     // Leave at least 18 columns for the right-hand text in an ordinary terminal.
     let first_width = longest_first.saturating_add(4)
-        .max(24)
-        .min(50)
+        .clamp(24, 50)
         .min(total_width.saturating_sub(18));
     let mut items = Vec::with_capacity(songs.len() * 2);
     for song in songs {
@@ -1476,9 +1473,7 @@ fn render_download_status(frame: &mut ratatui::Frame, app: &mut App) {
         .len()
         .saturating_sub(visible_lines)
         .min(u16::MAX as usize) as u16;
-    if app.log_follow {
-        app.log_scroll = max_scroll;
-    } else if app.log_scroll > max_scroll {
+    if app.log_follow || app.log_scroll > max_scroll {
         app.log_scroll = max_scroll;
     }
     let log_text = logs.iter().map(|line| parse_ansi_line(line)).collect::<Vec<_>>();
@@ -1679,19 +1674,31 @@ fn cleanup_abandoned_staging(download_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Phase 2C: download every selected HTTP stem without consulting either
-/// historical progress tracker or C23 Resume. Each accepted stem is checked
-/// against the requested name and key before independent safe publication.
-fn run_stateless_http_download(
-    song_url: &str,
+struct StatelessDownloadRequest<'a> {
+    song_url: &'a str,
     count_in: bool,
     transpose: i8,
     selected_tracks: Vec<String>,
-    download_root: &Path,
-    song_destination: &Path,
+    download_root: &'a Path,
+    song_destination: &'a Path,
     policy: tasks::download_song::ExistingFilePolicy,
     published: std::sync::mpsc::Sender<String>,
-) -> Result<()> {
+}
+
+/// Phase 2C: download every selected HTTP stem without consulting either
+/// historical progress tracker or C23 Resume. Each accepted stem is checked
+/// against the requested name and key before independent safe publication.
+fn run_stateless_http_download(request: StatelessDownloadRequest<'_>) -> Result<()> {
+    let StatelessDownloadRequest {
+        song_url,
+        count_in,
+        transpose,
+        selected_tracks,
+        download_root,
+        song_destination,
+        policy,
+        published,
+    } = request;
     let domain = extract_domain_from_url(song_url)
         .ok_or_else(|| anyhow!("Missing domain from URL"))?;
 
@@ -2191,10 +2198,10 @@ fn handle_download_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
         KeyCode::End => {
             app.log_follow = true;
         }
-        KeyCode::Esc => {
-            if app.download.as_ref().and_then(|d| d.done.as_ref()).is_some() {
-                app.screen = Screen::Menu;
-            }
+        KeyCode::Esc
+            if app.download.as_ref().and_then(|d| d.done.as_ref()).is_some() =>
+        {
+            app.screen = Screen::Menu;
         }
         _ => {}
     }
@@ -2399,7 +2406,7 @@ impl Write for LogWriter {
         let mut guard = self
             .buffer
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "log buffer poisoned"))?;
+            .map_err(|_| io::Error::other("log buffer poisoned"))?;
         guard.partial.push_str(&text);
         let mut completed_lines = Vec::new();
         while let Some(pos) = guard.partial.find('\n') {
@@ -2413,7 +2420,7 @@ impl Write for LogWriter {
         if let Some(diagnostics) = &self.diagnostics {
             let mut file = diagnostics
                 .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "diagnostics file poisoned"))?;
+                .map_err(|_| io::Error::other("diagnostics file poisoned"))?;
             for line in completed_lines {
                 writeln!(file, "{}", strip_ansi_codes(&line))?;
             }
@@ -2425,7 +2432,7 @@ impl Write for LogWriter {
         if let Some(diagnostics) = &self.diagnostics {
             diagnostics
                 .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "diagnostics file poisoned"))?
+                .map_err(|_| io::Error::other("diagnostics file poisoned"))?
                 .flush()?;
         }
         Ok(())
@@ -2510,7 +2517,7 @@ fn parse_ansi_line(input: &str) -> Line<'static> {
                 spans.push(Span::styled(std::mem::take(&mut buf), current));
             }
             let mut code = String::new();
-            while let Some(c) = chars.next() {
+            for c in chars.by_ref() {
                 if c == 'm' {
                     break;
                 }
@@ -3456,16 +3463,16 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                     &worker_song_destination,
                 )?;
 
-                run_stateless_http_download(
-                    &song_url,
-                    intro_click,
-                    key_shift,
+                run_stateless_http_download(StatelessDownloadRequest {
+                    song_url: &song_url,
+                    count_in: intro_click,
+                    transpose: key_shift,
                     selected_tracks,
-                    &worker_download_dir,
-                    &worker_song_destination,
-                    file_policy,
-                    published_tx,
-                )
+                    download_root: &worker_download_dir,
+                    song_destination: &worker_song_destination,
+                    policy: file_policy,
+                    published: published_tx,
+                })
             });
             app.download = Some(DownloadState {
                 song,
@@ -3488,7 +3495,7 @@ fn extract_base_key(doc: &Html, selector: &Selector) -> Option<String> {
     for node in doc.select(selector) {
         let text = normalize_text(node.text());
         if let Some(rest) = text.strip_prefix("In the same key as the original:") {
-            let key = rest.trim().split_whitespace().last().unwrap_or_default();
+            let key = rest.split_whitespace().last().unwrap_or_default();
             if !key.is_empty() {
                 return Some(key.to_string());
             }
@@ -3881,10 +3888,6 @@ mod artist_song_folder_names {
     }
 }
 
-
-/// Construct an Artist/Song destination under the selected download root.
-/// Does not create directories or modify files.
-#[allow(dead_code)]
 /// Build a song-folder name for the selected transposition.
 /// Does not access or modify the filesystem.
 #[allow(dead_code)]
@@ -4768,7 +4771,7 @@ mod keyed_song_destination_tests {
         KVUI_SONG_SOURCE_FILE,
     };
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -4795,7 +4798,7 @@ mod keyed_song_destination_tests {
         root
     }
 
-    fn select(root: &PathBuf, shift: i8) -> PathBuf {
+    fn select(root: &Path, shift: i8) -> PathBuf {
         kvui_select_keyed_song_destination(
             root, "Eagles", "Hotel California", URL, shift
         )
