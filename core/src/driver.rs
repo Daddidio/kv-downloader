@@ -43,7 +43,10 @@ pub struct Driver {
 
 impl Driver {
     pub fn new(config: Config) -> Self {
+        let browser_path = headless_chrome::browser::default_executable().ok();
+
         let browser = Browser::new(LaunchOptions {
+            path: browser_path,
             headless: config.headless,
             window_size: Some((1440, 1200)),
             enable_logging: true,
