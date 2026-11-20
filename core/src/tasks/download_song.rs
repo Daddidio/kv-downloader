@@ -1117,6 +1117,7 @@ fn download_http_track(
         .header("X-Requested-With", "XMLHttpRequest")
         .send()?
         .error_for_status()?;
+
     checked_text(basket)?;
 
     // A fast basket response can leave the previous completed mix visible briefly.
@@ -1873,6 +1874,7 @@ fn poll_for_file_url(
                 resp.status(),
                 start.elapsed().as_millis()
             );
+
             return Ok(candidate.to_string());
         }
 
@@ -2437,11 +2439,8 @@ fn download_file(
     let is_fresh = http_server_file_is_fresh(modified_at, first_requested_at);
     let mut provenance_verified = is_fresh;
     if !is_fresh {
-        tracing::warn!(
-            "KVUI-09 EXPERIMENT: cached MP3 allowed past timestamp check"
-        );
+        tracing::info!("Server returned a previously generated MP3; verifying provenance");
     }
-
     let accepted_etag = resp
         .headers()
         .get("etag")
@@ -2459,12 +2458,17 @@ fn download_file(
             }
             _ => false,
         };
-        if verified { provenance_verified = true; tracing::info!("KVUI-09 EXPERIMENT: cached MP3 provenance verified"
-            );
+        if verified {
+            provenance_verified = true;
+            tracing::info!("Cached MP3 provenance verified");
         } else {
             tracing::warn!(
-                "KVUI-09 EXPERIMENT: cached MP3 accepted without verified provenance"
+                "Rejecting cached MP3 without verified request provenance"
             );
+            std::fs::remove_file(path)?;
+            return Err(anyhow!(
+                "Cached MP3 does not have verified provenance for the requested mix"
+            ));
         }
     }
     Ok((accepted_etag, provenance_verified))
