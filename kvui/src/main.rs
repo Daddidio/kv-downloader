@@ -30,6 +30,7 @@ struct Song {
     title: String,
     artist: String,
     url: String,
+	#[allow(dead_code)]
     first_seen: i64,
     purchase_date: i64,
 }
@@ -57,25 +58,22 @@ enum Screen {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SongSort {
-    DateDescending,
-    Artist,
     Title,
+    Artist,
 }
 
 impl SongSort {
     fn next(self) -> Self {
         match self {
-            Self::DateDescending => Self::Artist,
+            Self::Title => Self::Artist,
             Self::Artist => Self::Title,
-            Self::Title => Self::DateDescending,
         }
     }
 
     fn label(self) -> &'static str {
         match self {
-            Self::DateDescending => "Recently added",
-            Self::Artist => "Artist",
             Self::Title => "Title",
+            Self::Artist => "Artist",
         }
     }
 }
@@ -135,7 +133,7 @@ impl App {
             all_songs: Vec::new(),
             songs_state: ListState::default(),
             songs_display_state: ListState::default(),
-            song_sort: SongSort::DateDescending,
+            song_sort: SongSort::Title,
             song_filter: String::new(),
             editing_song_filter: false,
             tracks: Vec::new(),
@@ -670,6 +668,7 @@ fn handle_menu_keys(
 }
 
 fn set_song_list(app: &mut App, songs: Vec<Song>) {
+    app.song_sort = SongSort::Title;
     app.all_songs = songs;
     apply_song_view(app);
     app.screen = Screen::Songs;
@@ -688,14 +687,6 @@ fn apply_song_view(app: &mut App) {
         .cloned()
         .collect();
     match app.song_sort {
-        SongSort::DateDescending => app.songs.sort_by(|left, right| {
-            right
-                .purchase_date
-                .cmp(&left.purchase_date)
-                .then_with(|| right.first_seen.cmp(&left.first_seen))
-                .then_with(|| left.artist.to_lowercase().cmp(&right.artist.to_lowercase()))
-                .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
-        }),
         SongSort::Artist => app.songs.sort_by(|left, right| {
             left.artist
                 .to_lowercase()
@@ -966,12 +957,61 @@ mod c24_navigation_selection_tests {
         let first_index = app.songs.iter().position(|song| song.url == wanted).unwrap();
         app.songs_state.select(Some(first_index));
 
-        for expected in [SongSort::Artist, SongSort::Title, SongSort::DateDescending] {
+        for expected in [SongSort::Artist, SongSort::Title] {
             cycle_song_sort_preserving_selection(&mut app);
             assert_eq!(app.song_sort, expected);
             let selected = app.songs_state.selected().unwrap();
             assert_eq!(app.songs[selected].url, wanted);
         }
+    }
+
+    #[test]
+    fn opening_song_list_resets_sort_to_title() {
+        let mut app = test_app();
+        let songs = vec![
+            Song {
+                artist: "Zulu".into(),
+                title: "Alpha".into(),
+                url: "https://example.test/one".into(),
+                first_seen: 1,
+                purchase_date: 20260101,
+            },
+            Song {
+                artist: "Beta".into(),
+                title: "Charlie".into(),
+                url: "https://example.test/two".into(),
+                first_seen: 2,
+                purchase_date: 20260201,
+            },
+            Song {
+                artist: "Alpha".into(),
+                title: "Bravo".into(),
+                url: "https://example.test/three".into(),
+                first_seen: 3,
+                purchase_date: 20260301,
+            },
+        ];
+
+        set_song_list(&mut app, songs.clone());
+
+        assert_eq!(app.screen, Screen::Songs);
+        assert_eq!(app.song_sort, SongSort::Title);
+
+        let titles: Vec<&str> = app.songs.iter()
+            .map(|song| song.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["Alpha", "Bravo", "Charlie"]);
+
+        app.song_sort = SongSort::Artist;
+        apply_song_view(&mut app);
+        app.screen = Screen::SongDetail;
+        back_from_song_details(&mut app);
+        assert_eq!(app.song_sort, SongSort::Artist);
+        set_song_list(&mut app, songs);
+        assert_eq!(app.song_sort, SongSort::Title);
+        assert_eq!(app.songs[0].title, "Alpha");
+        assert_eq!(app.songs[1].title, "Bravo");
+        assert_eq!(app.songs[2].title, "Charlie");
     }
 
     #[test]
@@ -1126,7 +1166,7 @@ fn render_menu(frame: &mut ratatui::Frame, app: &mut App) {
         .wrap(Wrap { trim: true });
     frame.render_widget(status, chunks[2]);
 
-    frame.render_widget(footer_help("Enter: select | ESC: back | Ctrl+C: quit"), chunks[3]);
+    frame.render_widget(footer_help("Enter: select | ESC: back"), chunks[3]);
 }
 
 /// Render lower instruction bars with one consistent readable style.
@@ -3075,8 +3115,6 @@ mod c24_visual_readability_tests {
         let artist_row = song_list_row(&photograph, SongSort::Artist, 25, 64);
         assert!(artist_row.starts_with("Def Leppard"));
         assert_eq!(artist_row.find("Photograph"), Some(25));
-        assert!(song_list_row(&photograph, SongSort::DateDescending, 25, 64)
-            .starts_with("Photograph"));
     }
 
     #[test]
