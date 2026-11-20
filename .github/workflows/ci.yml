@@ -25,8 +25,19 @@ jobs:
         with:
           packages: libdbus-glib-1-dev
       # Formatting enforcement deferred until a dedicated source-formatting cleanup.
-      - run: cargo test
-      - run: cargo clippy
+      - name: Unit tests
+        run: cargo test --workspace --exclude kv_core
+
+      - name: Core unit tests
+        run: cargo test -p kv_core --lib
+
+      - name: Chromium integration test
+        if: ${{ !cancelled() }}
+        run: cargo test -p kv_core --test download_songs
+
+      - name: Clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --workspace --all-targets
 
   check-win:
     name: "win: cargo clippy && cargo test"
@@ -38,7 +49,8 @@ jobs:
         with:
           toolchain: stable
       - run: cargo test
-      - run: cargo clippy
+      - if: ${{ !cancelled() }}
+        run: cargo clippy --workspace --all-targets
 
   check-macos:
     name: "macos: cargo clippy && cargo test"
@@ -49,5 +61,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
-      - run: cargo test
-      - run: cargo clippy
+      - name: Unit tests
+        run: cargo test --workspace --exclude kv_core
+
+      - name: Core unit tests
+        run: cargo test -p kv_core --lib
+
+      - name: Chromium integration test
+        if: ${{ !cancelled() }}
+        run: cargo test -p kv_core --test download_songs
+
+      - name: Clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --workspace --all-targets
